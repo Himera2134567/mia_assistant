@@ -45,6 +45,8 @@ Write-Host "Installing dependencies..." -ForegroundColor Yellow
 if ($WithVoice) {
     Write-Host "Installing local speech-to-text..." -ForegroundColor Yellow
     & $VenvPython -m pip install -r "requirements-voice.txt"
+    & (Join-Path $ProjectRoot "download_voice_model.ps1")
+    & $VenvPython -c "from vosk import Model; from mia_voice import native_model_path; Model(native_model_path('models/vosk-ru')); print('Russian Vosk model: OK')"
 }
 
 $EnvPath = Join-Path $ProjectRoot ".env"

@@ -48,7 +48,7 @@ VOICE_INPUT_AVAILABLE = bool(
 sd = None
 WhisperModel = None
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal
+from PySide6.QtCore import QLocale, Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -70,13 +70,20 @@ from mia_core import (
     complete_openrouter,
     conversation_to_markdown,
     fetch_openrouter_models,
+    resolve_voice_command,
     stream_openrouter,
 )
+from mia_voice import VOICE_RUNTIME_AVAILABLE, WakeWordWorker, vosk_model_ready
 
-APP_TITLE = "MIA Assistant 2.0"
+APP_TITLE = "MIA Assistant 2.1"
 APP_ICON_PATH = os.path.join(BUNDLE_DIR, "ui", "avatar_mia_v3.png")
 CHAT_HISTORY_PATH = os.path.join(DATA_DIR, "memory", "chat_history.json")
 WHISPER_MODELS_PATH = os.path.join(DATA_DIR, "models", "whisper")
+VOSK_MODEL_PATH = os.getenv("MIA_VOSK_MODEL_PATH", "").strip() or os.path.join(
+    DATA_DIR,
+    "models",
+    "vosk-ru",
+)
 
 DEFAULT_OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
 DEFAULT_OPENROUTER_KEY   = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -256,6 +263,7 @@ class VoiceInputWorker(QThread):
                 recording.reshape(-1),
                 vad_filter=False,
                 beam_size=3,
+                language="ru",
             )
             text = " ".join(segment.text.strip() for segment in segments).strip()
             if not text:
@@ -391,6 +399,10 @@ class ChatTab(QWidget):
         self._workers: List[QThread] = []
         self._chat_worker: Optional[ChatStreamWorker] = None
         self._voice_worker: Optional[VoiceInputWorker] = None
+        self._wake_worker: Optional[WakeWordWorker] = None
+        self._voice_request_pending = False
+        self._voice_waiting_for_tts = False
+        self._wake_armed = False
         self._stream_text = ""
         self._error_text = ""
 
@@ -398,7 +410,29 @@ class ChatTab(QWidget):
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._render_history)
 
+        self._wake_timer = QTimer(self)
+        self._wake_timer.setSingleShot(True)
+        self._wake_timer.setInterval(10_000)
+        self._wake_timer.timeout.connect(self._disarm_wake_word)
+
+        self._voice_resume_timer = QTimer(self)
+        self._voice_resume_timer.setSingleShot(True)
+        self._voice_resume_timer.setInterval(180_000)
+        self._voice_resume_timer.timeout.connect(self._resume_voice_listening)
+
         self.tts = QTextToSpeech(self) if QTextToSpeech is not None else None
+        if self.tts is not None:
+            russian_locale = QLocale("ru_RU")
+            if russian_locale in self.tts.availableLocales():
+                self.tts.setLocale(russian_locale)
+                russian_voices = self.tts.availableVoices()
+                preferred = next(
+                    (voice for voice in russian_voices if "Irina" in voice.name()),
+                    russian_voices[0] if russian_voices else None,
+                )
+                if preferred is not None:
+                    self.tts.setVoice(preferred)
+            self.tts.stateChanged.connect(self._on_tts_state_changed)
 
         layout = QVBoxLayout(self)
 
@@ -444,6 +478,26 @@ class ChatTab(QWidget):
         actions.addWidget(self.autoSpeak)
         actions.addStretch(1)
 
+        voice_row = QHBoxLayout()
+        self.voiceModeBtn = QPushButton("Голосовой режим: ВЫКЛ")
+        self.voiceModeBtn.setObjectName("voiceModeButton")
+        self.voiceModeBtn.setCheckable(True)
+        self.voiceModeBtn.setEnabled(
+            VOICE_RUNTIME_AVAILABLE and vosk_model_ready(VOSK_MODEL_PATH)
+        )
+        self.voiceModeBtn.setToolTip(
+            "После включения скажи «Мия», затем команду. Обработка речи выполняется локально."
+        )
+        self.voiceModeBtn.toggled.connect(self.toggle_voice_mode)
+        self.voiceStatus = QLabel(
+            "Скажи «Мия» после включения"
+            if self.voiceModeBtn.isEnabled()
+            else "Установи русскую модель: setup.ps1 -WithVoice"
+        )
+        self.voiceStatus.setObjectName("voiceStatus")
+        voice_row.addWidget(self.voiceModeBtn)
+        voice_row.addWidget(self.voiceStatus, 1)
+
         self.out = QTextBrowser()
         self.out.setOpenExternalLinks(True)
         self.out.setPlaceholderText("Здесь появится диалог с MIA.")
@@ -481,6 +535,7 @@ class ChatTab(QWidget):
 
         layout.addLayout(top)
         layout.addLayout(actions)
+        layout.addLayout(voice_row)
         layout.addWidget(self.out)
         layout.addWidget(self.input)
         layout.addLayout(send_row)
@@ -588,6 +643,8 @@ class ChatTab(QWidget):
         worker.completed.connect(self._on_completed)
         worker.failed.connect(self._on_failed)
         worker.finished.connect(worker.deleteLater)
+        if self._wake_worker is not None:
+            self._wake_worker.set_paused(True)
         self._toggle_ui(True)
         self.modelStatus.setText("MIA думает…")
         worker.start()
@@ -598,6 +655,8 @@ class ChatTab(QWidget):
             self._render_timer.start(70)
 
     def _on_completed(self, answer: str, cancelled: bool):
+        voice_request = self._voice_request_pending
+        self._voice_request_pending = False
         self._render_timer.stop()
         self._stream_text = ""
         if answer:
@@ -608,15 +667,20 @@ class ChatTab(QWidget):
         self._render_history()
         if cancelled:
             self.modelStatus.setText("Генерация остановлена")
+            self._resume_voice_listening()
         else:
             self.modelStatus.setText(f"Готово · {self._current_model()}")
-            if answer and self.autoSpeak.isChecked():
-                self._speak(answer)
+            should_speak = bool(answer) and (voice_request or self.autoSpeak.isChecked())
+            if should_speak:
+                self._speak(answer, resume_voice=self.voiceModeBtn.isChecked())
+            else:
+                self._resume_voice_listening()
 
     def _on_failed(self, message: str):
         self._render_timer.stop()
         self._stream_text = ""
         self._error_text = message
+        self._voice_request_pending = False
         self._chat_worker = None
         self._toggle_ui(False)
         self.modelStatus.setText("Ошибка подключения")
@@ -624,6 +688,7 @@ class ChatTab(QWidget):
         self.modelStatus.style().unpolish(self.modelStatus)
         self.modelStatus.style().polish(self.modelStatus)
         self._render_history()
+        self._resume_voice_listening()
 
     def stop_generation(self):
         if self._chat_worker is not None:
@@ -677,17 +742,25 @@ class ChatTab(QWidget):
         else:
             self.modelStatus.setText("Ответа пока нет")
 
-    def _speak(self, text: str):
+    def _speak(self, text: str, resume_voice: bool = False):
         if self.tts is None:
             self.modelStatus.setText("Синтез речи недоступен")
+            if resume_voice:
+                self._resume_voice_listening()
             return
+        if self._wake_worker is not None:
+            self._wake_worker.set_paused(True)
         self.tts.stop()
+        self._voice_waiting_for_tts = resume_voice
+        if resume_voice:
+            self.voiceStatus.setText("MIA отвечает голосом…")
+            self._voice_resume_timer.start()
         self.tts.say(text[:6000])
 
     def speak_last_answer(self):
         answer = self._last_answer()
         if answer:
-            self._speak(answer)
+            self._speak(answer, resume_voice=self.voiceModeBtn.isChecked())
             self.modelStatus.setText("Озвучиваю ответ")
         else:
             self.modelStatus.setText("Ответа пока нет")
@@ -726,7 +799,120 @@ class ChatTab(QWidget):
         worker.finished.connect(cleanup_voice)
         worker.start()
 
+    def toggle_voice_mode(self, enabled: bool):
+        if enabled:
+            if not VOICE_RUNTIME_AVAILABLE or not vosk_model_ready(VOSK_MODEL_PATH):
+                self.voiceModeBtn.blockSignals(True)
+                self.voiceModeBtn.setChecked(False)
+                self.voiceModeBtn.blockSignals(False)
+                self.voiceStatus.setText("Выполни setup.ps1 -WithVoice")
+                return
+            self.voiceModeBtn.setText("Голосовой режим: ВКЛ")
+            self.voiceStatus.setText("Загружаю русскую модель Vosk…")
+            worker = WakeWordWorker(VOSK_MODEL_PATH)
+            self._wake_worker = worker
+            worker.ready.connect(self._on_voice_mode_ready)
+            worker.partial.connect(self._on_voice_partial)
+            worker.phrase.connect(self._on_voice_phrase)
+            worker.failed.connect(self._on_voice_mode_failed)
+
+            def cleanup_wake():
+                if self._wake_worker is worker:
+                    self._wake_worker = None
+                worker.deleteLater()
+
+            worker.finished.connect(cleanup_wake)
+            worker.start()
+        else:
+            self._wake_timer.stop()
+            self._voice_resume_timer.stop()
+            self._wake_armed = False
+            self._voice_request_pending = False
+            self._voice_waiting_for_tts = False
+            if self.tts is not None:
+                self.tts.stop()
+            worker = self._wake_worker
+            if worker is not None:
+                worker.stop_listening()
+                worker.wait(1500)
+            self.voiceModeBtn.setText("Голосовой режим: ВЫКЛ")
+            self.voiceStatus.setText("Микрофон выключен")
+
+    def _on_voice_mode_ready(self):
+        self.voiceStatus.setText("Слушаю локально · скажи «Мия»")
+        self.modelStatus.setText("Русский голосовой режим готов")
+
+    def _on_voice_partial(self, text: str):
+        if self._wake_worker is not None and not self._voice_request_pending:
+            self.voiceStatus.setText(f"Слышу: {text[:90]}")
+
+    def _on_voice_phrase(self, text: str, constrained_wake: bool = False):
+        if not self.voiceModeBtn.isChecked() or self._chat_worker is not None:
+            return
+        heard_wake, command = resolve_voice_command(text, constrained_wake)
+        if heard_wake:
+            if command:
+                self._submit_voice_command(command)
+            else:
+                self._wake_armed = True
+                self._wake_timer.start()
+                self.voiceStatus.setText("Слушаю команду…")
+                QApplication.beep()
+            return
+        if self._wake_armed:
+            self._wake_timer.stop()
+            self._wake_armed = False
+            self._submit_voice_command(text)
+        else:
+            self.voiceStatus.setText("Слушаю локально · скажи «Мия»")
+
+    def _submit_voice_command(self, command: str):
+        command = command.strip()
+        if not command:
+            return
+        self._wake_armed = False
+        self._wake_timer.stop()
+        if self._wake_worker is not None:
+            self._wake_worker.set_paused(True)
+        self.voiceStatus.setText(f"Команда: {command[:100]}")
+        self.input.setPlainText(command)
+        self._voice_request_pending = True
+        self.on_ask()
+        if self._chat_worker is None:
+            self._voice_request_pending = False
+            self._resume_voice_listening()
+
+    def _disarm_wake_word(self):
+        self._wake_armed = False
+        self.voiceStatus.setText("Команда не услышана · скажи «Мия» ещё раз")
+
+    def _on_tts_state_changed(self, state):
+        if (
+            self.tts is not None
+            and state == QTextToSpeech.State.Ready
+            and self._voice_waiting_for_tts
+        ):
+            self._voice_waiting_for_tts = False
+            self._voice_resume_timer.stop()
+            QTimer.singleShot(350, self._resume_voice_listening)
+
+    def _resume_voice_listening(self):
+        self._voice_waiting_for_tts = False
+        self._voice_resume_timer.stop()
+        if self.voiceModeBtn.isChecked() and self._wake_worker is not None:
+            self._wake_worker.set_paused(False)
+            self.voiceStatus.setText("Слушаю локально · скажи «Мия»")
+
+    def _on_voice_mode_failed(self, message: str):
+        self._error_text = message
+        self._render_history()
+        self.voiceStatus.setText(message)
+        self.voiceModeBtn.setChecked(False)
+
     def closeEvent(self, event):
+        if self._wake_worker is not None:
+            self._wake_worker.stop_listening()
+            self._wake_worker.wait(1500)
         if self._chat_worker is not None:
             self._chat_worker.cancel()
             self._chat_worker.wait(1500)
@@ -2175,7 +2361,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("MIA Assistant")
-    app.setApplicationVersion("2.0.0")
+    app.setApplicationVersion("2.1.0")
     app.setStyle("Fusion")
     if os.path.exists(APP_ICON_PATH):
         app.setWindowIcon(QIcon(APP_ICON_PATH))

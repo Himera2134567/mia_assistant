@@ -2,7 +2,9 @@ from mia_core import (
     ConversationStore,
     build_context,
     conversation_to_markdown,
+    extract_wake_command,
     iter_sse_content,
+    resolve_voice_command,
 )
 
 
@@ -64,3 +66,22 @@ def test_conversation_markdown():
     assert "## Вы" in text
     assert "## MIA" in text
     assert text.endswith("\n")
+
+
+def test_extract_wake_command_from_same_phrase():
+    assert extract_wake_command("Мия, расскажи про Python!") == (
+        True,
+        "расскажи про python",
+    )
+
+
+def test_extract_wake_command_supports_separate_wake_word():
+    assert extract_wake_command("МИА") == (True, "")
+    assert extract_wake_command("обычная фраза") == (False, "")
+
+
+def test_constrained_wake_recovers_when_free_model_hears_mir():
+    assert resolve_voice_command("мир расскажи анекдот", constrained_wake=True) == (
+        True,
+        "расскажи анекдот",
+    )

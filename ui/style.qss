@@ -52,6 +52,17 @@ QPushButton#dangerButton {
     color: #ffb3be;
 }
 QPushButton#dangerButton:hover { background-color: #5a1f2c; }
+QPushButton#voiceModeButton {
+    background-color: #122033;
+    color: #8ba4bd;
+    border-color: #2b3d52;
+}
+QPushButton#voiceModeButton:checked {
+    background-color: #0b3b35;
+    color: #6fffc7;
+    border-color: #2ea97d;
+}
+QLabel#voiceStatus { color: #65b7ff; }
 QPushButton#dangerButton:disabled,
 QPushButton#secondaryButton:disabled {
     background-color: #172235;

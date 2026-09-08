@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -279,3 +280,26 @@ def conversation_to_markdown(messages: Sequence[Mapping[str, str]]) -> str:
         if content:
             parts.extend((f"## {role}", "", content, ""))
     return "\n".join(parts).rstrip() + "\n"
+
+
+def extract_wake_command(
+    text: str,
+    wake_words: Sequence[str] = ("мия", "миа", "мие"),
+) -> tuple[bool, str]:
+    """Return whether a wake word was heard and the command after it."""
+    normalized = re.sub(r"[^\w\s-]", " ", text.casefold(), flags=re.UNICODE)
+    words = normalized.split()
+    wake_set = {word.casefold() for word in wake_words}
+    for index, word in enumerate(words):
+        if word in wake_set:
+            return True, " ".join(words[index + 1 :]).strip()
+    return False, ""
+
+
+def resolve_voice_command(text: str, constrained_wake: bool = False) -> tuple[bool, str]:
+    """Combine free recognition with the dedicated wake-word recognizer."""
+    heard_wake, command = extract_wake_command(text)
+    if constrained_wake and not heard_wake:
+        words = text.split()
+        return True, " ".join(words[1:]).strip() if len(words) > 1 else ""
+    return heard_wake, command
