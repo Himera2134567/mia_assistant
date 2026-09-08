@@ -1,28 +1,89 @@
-# MIA Assistant
+# MIA Assistant 2.0
 
-MIA is a Windows desktop AI assistant built with Python and PySide6. The current
-version combines an OpenRouter chat, web search, Git utilities, code review,
-technical-specification drafting, development methodologies, and project rules
-in one interface.
+MIA — настольный ИИ-ассистент для Windows в духе Джарвиса. Приложение написано
+на Python и PySide6 и объединяет обычный чат, инструменты разработчика, поиск,
+GitHub и локальные голосовые функции.
 
-## Current state
+## Что умеет MIA
 
-This first public version preserves the project as it existed before the next
-major improvement pass. Local secrets, downloaded models, logs, memory, the
-virtual environment, and personal documents are intentionally not published.
+- отвечает через любую доступную модель OpenRouter и показывает ответ по мере генерации;
+- помнит контекст текущего диалога и восстанавливает его после перезапуска;
+- загружает актуальный список моделей OpenRouter прямо в интерфейсе;
+- останавливает генерацию, копирует последний ответ и экспортирует разговор в Markdown;
+- озвучивает ответы системным голосом Windows;
+- при установленных голосовых зависимостях распознаёт шестисекундную диктовку локальным Whisper;
+- ищет информацию через DuckDuckGo и извлекает основной текст страницы;
+- объясняет и проверяет код, составляет ТЗ и планы разработки;
+- помогает создать GitHub-репозиторий, предварительно проверив проект на секреты;
+- содержит справочник по методологиям и правилам оформления проекта.
 
-## Entry point
+## Быстрый запуск на Windows
+
+1. Установи Python 3.10 или новее.
+2. Запусти `setup.ps1` из PowerShell:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\setup.ps1
+   ```
+
+3. Открой созданный локальный файл `.env` и вставь свой ключ:
+
+   ```dotenv
+   OPENROUTER_API_KEY=твой_ключ
+   OPENROUTER_MODEL=deepseek/deepseek-chat
+   ```
+
+4. Запусти `autorun.bat` двойным кликом.
+
+Ключ можно передать установщику сразу, не редактируя файл вручную:
 
 ```powershell
-python mia_dev_agent.py
+.\setup.ps1 -OpenRouterKey "твой_ключ" -Launch
 ```
 
-Configuration is read from `.env`. Start by copying `.env.example` to `.env`
-and add your own OpenRouter key. Never commit `.env`.
+`.env` никогда не отправляется в GitHub.
 
-Windows setup and launch helpers are provided in `setup.ps1` and `autorun.bat`.
+## Голосовой ввод
 
-## GitHub help
+Озвучивание ответов работает вместе с PySide6. Для кнопки диктовки установи
+дополнительные локальные зависимости:
 
-A short Russian-language guide for working with this repository is available in
-[GITHUB_GUIDE.md](GITHUB_GUIDE.md).
+```powershell
+.\setup.ps1 -WithVoice
+```
+
+При первом использовании Whisper может скачать небольшую модель `tiny` в
+локальную папку `models`. Эта папка также исключена из Git.
+
+## Разработка и проверка
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+Собрать переносимую Windows-версию:
+
+```powershell
+.\build.ps1
+```
+
+Результат появится в `dist\MIA-Dev-Agent`.
+
+## Структура
+
+- `mia_dev_agent.py` — Qt-интерфейс и вкладки приложения;
+- `mia_core.py` — клиент OpenRouter, потоковая генерация и локальная память;
+- `ui/` — оригинальная эмблема MIA и тема интерфейса;
+- `tests/` — тесты ядра;
+- `GITHUB_GUIDE.md` — отдельная русская памятка по работе с GitHub;
+- `CHANGELOG.md` — список заметных изменений.
+
+История чата хранится локально в `memory/chat_history.json`. Ключи, история,
+логи, модели, виртуальное окружение и личные документы не публикуются.
+
+## Памятка по GitHub
+
+Если Git пока незнаком, начни с [GITHUB_GUIDE.md](GITHUB_GUIDE.md): там есть
+короткий безопасный порядок `status → add → commit → push` и объяснение основных
+команд без лишней теории.

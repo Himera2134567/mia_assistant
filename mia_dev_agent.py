@@ -6,11 +6,16 @@
 import os
 import sys
 import re
-import urllib.parse
+import base64
+import importlib.util
+import threading
 from typing import Optional, List, Dict, Tuple
 
 from dotenv import load_dotenv
-load_dotenv()
+
+BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else BUNDLE_DIR
+load_dotenv(os.path.join(DATA_DIR, ".env"))
 
 import requests
 
@@ -36,17 +41,42 @@ except ImportError:
     Repo = None
     GitCommandError = InvalidGitRepositoryError = NoSuchPathError = Exception
 
+VOICE_INPUT_AVAILABLE = bool(
+    importlib.util.find_spec("sounddevice")
+    and importlib.util.find_spec("faster_whisper")
+)
+sd = None
+WhisperModel = None
+
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
-from PySide6.QtGui import QIcon, QTextOption
+from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QPlainTextEdit, QTabWidget, QFileDialog, QGridLayout, QTableWidget,
     QTableWidgetItem, QGroupBox, QCheckBox, QSplitter, QMessageBox, QAbstractItemView,
-    QListWidget, QListWidgetItem
+    QListWidget, QListWidgetItem, QComboBox, QTextBrowser
 )
 
-APP_TITLE = "MIA — Мини-GUI"
-APP_ICON_PATH = os.path.join("ui", "avatar_idle.png")
+try:
+    from PySide6.QtTextToSpeech import QTextToSpeech
+except ImportError:
+    QTextToSpeech = None
+
+from mia_core import (
+    DEFAULT_SYSTEM_PROMPT,
+    ConversationStore,
+    MIAConfig,
+    build_context,
+    complete_openrouter,
+    conversation_to_markdown,
+    fetch_openrouter_models,
+    stream_openrouter,
+)
+
+APP_TITLE = "MIA Assistant 2.0"
+APP_ICON_PATH = os.path.join(BUNDLE_DIR, "ui", "avatar_mia_v3.png")
+CHAT_HISTORY_PATH = os.path.join(DATA_DIR, "memory", "chat_history.json")
+WHISPER_MODELS_PATH = os.path.join(DATA_DIR, "models", "whisper")
 
 DEFAULT_OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
 DEFAULT_OPENROUTER_KEY   = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -145,6 +175,95 @@ class FuncWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
+
+class ChatStreamWorker(QThread):
+    chunk = Signal(str)
+    completed = Signal(str, bool)
+    failed = Signal(str)
+
+    def __init__(self, messages: List[Dict[str, str]], config: MIAConfig):
+        super().__init__()
+        self.messages = messages
+        self.config = config
+        self._cancel_event = threading.Event()
+
+    def cancel(self):
+        self._cancel_event.set()
+
+    def run(self):
+        try:
+            answer = stream_openrouter(
+                self.messages,
+                self.config,
+                self.chunk.emit,
+                cancel_event=self._cancel_event,
+            )
+            self.completed.emit(answer, self._cancel_event.is_set())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class VoiceInputWorker(QThread):
+    transcribed = Signal(str)
+    failed = Signal(str)
+    _model = None
+    _model_lock = threading.Lock()
+
+    def __init__(self, seconds: int = 6, sample_rate: int = 16_000):
+        super().__init__()
+        self.seconds = seconds
+        self.sample_rate = sample_rate
+
+    @staticmethod
+    def _load_dependencies():
+        global sd, WhisperModel
+        if not VOICE_INPUT_AVAILABLE:
+            raise RuntimeError(
+                "Для диктовки установи зависимости: pip install -r requirements-voice.txt"
+            )
+        if sd is None or WhisperModel is None:
+            import sounddevice as sounddevice_module
+            from faster_whisper import WhisperModel as whisper_model_class
+
+            sd = sounddevice_module
+            WhisperModel = whisper_model_class
+
+    @classmethod
+    def _get_model(cls):
+        with cls._model_lock:
+            if cls._model is None:
+                ensure_dir(WHISPER_MODELS_PATH)
+                cls._model = WhisperModel(
+                    "tiny",
+                    device="cpu",
+                    compute_type="int8",
+                    download_root=WHISPER_MODELS_PATH,
+                )
+            return cls._model
+
+    def run(self):
+        try:
+            self._load_dependencies()
+            recording = sd.rec(
+                int(self.seconds * self.sample_rate),
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="float32",
+            )
+            sd.wait()
+            model = self._get_model()
+            segments, _ = model.transcribe(
+                recording.reshape(-1),
+                vad_filter=False,
+                beam_size=3,
+            )
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+            if not text:
+                raise RuntimeError("Речь не распознана. Попробуй говорить ближе к микрофону.")
+            self.transcribed.emit(text)
+        except Exception as exc:
+            self.failed.emit(f"Ошибка диктовки: {exc}")
+
 # ================== LLM ==================
 
 def llm_complete(
@@ -156,34 +275,20 @@ def llm_complete(
 ) -> str:
     model = model or DEFAULT_OPENROUTER_MODEL
     key = (key or DEFAULT_OPENROUTER_KEY).strip()
-    if not key:
-        return "Нет OPENROUTER_API_KEY — оффлайн-режим.\n\n" + prompt[:600]
-
     if not system_prompt:
-        system_prompt = (
-            "Ты помогаешь разработчику кратко и по делу. "
-            "Ответ обычным текстом без Markdown-разметки."
-        )
-
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "HTTP-Referer": "https://local.mia",
-        "X-Title": "MIA-dev-agent"
-    }
-    data = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.4,
-        "max_tokens": 800
-    }
-    r = requests.post("https://openrouter.ai/api/v1/chat/completions",
-                      json=data, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    js = r.json()
-    return js["choices"][0]["message"]["content"]
+        system_prompt = DEFAULT_SYSTEM_PROMPT
+    config = MIAConfig(
+        api_key=key,
+        model=model,
+        system_prompt=system_prompt,
+        max_tokens=2000,
+    )
+    messages = build_context(
+        [{"role": "user", "content": prompt}],
+        system_prompt=system_prompt,
+        max_chars=50_000,
+    )
+    return complete_openrouter(messages, config, timeout=timeout)
 
 # ================== ПОИСК / READABILITY ==================
 
@@ -213,6 +318,7 @@ def fetch_readable(url: str, timeout: float = 15.0) -> Tuple[str, str]:
 
 SECRET_PATTERNS = [
     (r"gh[pous]_[A-Za-z0-9_]{36,}", "GitHub PAT"),
+    (r"github_pat_[A-Za-z0-9_]{20,}", "GitHub fine-grained PAT"),
     (r"sk-[A-Za-z0-9\-]{20,}", "OpenAI / OpenRouter key"),
     (r"AKIA[0-9A-Z]{16}", "AWS Access Key"),
     (r"AIza[0-9A-Za-z\-_]{35}", "Google API Key"),
@@ -240,6 +346,9 @@ def scan_secrets(root: str, files: Optional[List[str]] = None) -> List[Tuple[str
             for dirpath, dirnames, filenames in os.walk(root):
                 dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
                 for fn in filenames:
+                    if fn == ".env":
+                        # New repositories get a mandatory .env ignore rule before git add.
+                        continue
                     paths.append(os.path.join(dirpath, fn))
     else:
         paths = [os.path.join(root, p) if not os.path.isabs(p) else p for p in files]
@@ -257,36 +366,126 @@ def scan_secrets(root: str, files: Optional[List[str]] = None) -> List[Tuple[str
             continue
     return found
 
+
+def redact_secrets(text: str) -> str:
+    redacted = text
+    for pattern, name in SECRET_PATTERNS:
+        redacted = re.sub(pattern, f"<{name}: скрыто>", redacted)
+    return redacted
+
 # ================== ВКЛАДКА ЧАТ ==================
 
 class ChatTab(QWidget):
     def __init__(self, model: str):
         super().__init__()
-        self.model = model
+        self.config = MIAConfig.from_env()
+        self.config = MIAConfig(
+            api_key=self.config.api_key,
+            model=model or self.config.model,
+            system_prompt=self.config.system_prompt,
+            temperature=self.config.temperature,
+            max_tokens=2500,
+        )
+        self.store = ConversationStore(CHAT_HISTORY_PATH)
+        self.history = self.store.load()
         self._workers: List[QThread] = []
+        self._chat_worker: Optional[ChatStreamWorker] = None
+        self._voice_worker: Optional[VoiceInputWorker] = None
+        self._stream_text = ""
+        self._error_text = ""
+
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._render_history)
+
+        self.tts = QTextToSpeech(self) if QTextToSpeech is not None else None
 
         layout = QVBoxLayout(self)
 
         top = QHBoxLayout()
-        self.modelEdit = QLineEdit(self.model)
-        self.modelEdit.setPlaceholderText("model (OpenRouter)")
-        self.askBtn = QPushButton("Спросить")
-        self.askBtn.clicked.connect(self.on_ask)
+        top.addWidget(QLabel("Модель:"))
+        self.modelEdit = QComboBox()
+        self.modelEdit.setEditable(True)
+        self.modelEdit.addItem(self.config.model)
+        self.modelEdit.setCurrentText(self.config.model)
+        self.modelEdit.setMinimumWidth(280)
+        self.refreshModelsBtn = QPushButton("Обновить список")
+        self.refreshModelsBtn.setObjectName("secondaryButton")
+        self.refreshModelsBtn.clicked.connect(self.refresh_models)
+        self.modelStatus = QLabel(
+            "API-ключ найден" if self.config.api_key else "API-ключ не настроен"
+        )
+        self.modelStatus.setMinimumWidth(190)
+        self.modelStatus.setObjectName("statusOk" if self.config.api_key else "statusError")
         top.addWidget(self.modelEdit, 1)
-        top.addWidget(self.askBtn, 0)
+        top.addWidget(self.refreshModelsBtn)
+        top.addWidget(self.modelStatus)
+
+        actions = QHBoxLayout()
+        self.newChatBtn = QPushButton("Новый диалог")
+        self.newChatBtn.setObjectName("secondaryButton")
+        self.newChatBtn.clicked.connect(self.new_chat)
+        self.exportBtn = QPushButton("Экспорт .md")
+        self.exportBtn.setObjectName("secondaryButton")
+        self.exportBtn.clicked.connect(self.export_chat)
+        self.copyBtn = QPushButton("Копировать ответ")
+        self.copyBtn.setObjectName("secondaryButton")
+        self.copyBtn.clicked.connect(self.copy_last_answer)
+        self.speakBtn = QPushButton("Озвучить ответ")
+        self.speakBtn.setObjectName("secondaryButton")
+        self.speakBtn.clicked.connect(self.speak_last_answer)
+        self.autoSpeak = QCheckBox("Озвучивать автоматически")
+        self.speakBtn.setEnabled(self.tts is not None)
+        self.autoSpeak.setEnabled(self.tts is not None)
+        actions.addWidget(self.newChatBtn)
+        actions.addWidget(self.exportBtn)
+        actions.addWidget(self.copyBtn)
+        actions.addWidget(self.speakBtn)
+        actions.addWidget(self.autoSpeak)
+        actions.addStretch(1)
+
+        self.out = QTextBrowser()
+        self.out.setOpenExternalLinks(True)
+        self.out.setPlaceholderText("Здесь появится диалог с MIA.")
 
         self.input = QPlainTextEdit()
-        self.input.setPlaceholderText("Ваш вопрос…")
-        self.input.setMinimumHeight(80)
+        self.input.setPlaceholderText(
+            "Напиши задачу для MIA. Можно просить объяснить, придумать, проверить или составить план…"
+        )
+        self.input.setMinimumHeight(100)
+        self.input.setMaximumHeight(190)
 
-        self.out = QPlainTextEdit()
-        self.out.setReadOnly(True)
-        self.out.setMaximumBlockCount(20000)
-        self.out.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        send_row = QHBoxLayout()
+        hint = QLabel("Ctrl+Enter — отправить")
+        self.micBtn = QPushButton("Диктовать 6 сек")
+        self.micBtn.setObjectName("secondaryButton")
+        self.micBtn.setEnabled(VOICE_INPUT_AVAILABLE)
+        self.micBtn.setToolTip(
+            "Записать голос и преобразовать его в текст локальной моделью Whisper"
+        )
+        self.micBtn.clicked.connect(self.start_dictation)
+        self.stopBtn = QPushButton("Остановить")
+        self.stopBtn.setObjectName("dangerButton")
+        self.stopBtn.setEnabled(False)
+        self.stopBtn.clicked.connect(self.stop_generation)
+        self.askBtn = QPushButton("Отправить MIA")
+        self.askBtn.clicked.connect(self.on_ask)
+        send_row.addWidget(hint)
+        send_row.addStretch(1)
+        send_row.addWidget(self.micBtn)
+        send_row.addWidget(self.stopBtn)
+        send_row.addWidget(self.askBtn)
+
+        self.sendShortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        self.sendShortcut.activated.connect(self.on_ask)
 
         layout.addLayout(top)
-        layout.addWidget(self.input)
+        layout.addLayout(actions)
         layout.addWidget(self.out)
+        layout.addWidget(self.input)
+        layout.addLayout(send_row)
+
+        self._render_history()
 
     def _start_worker(self, w: QThread):
         self._workers.append(w)
@@ -299,18 +498,244 @@ class ChatTab(QWidget):
 
     def _toggle_ui(self, busy: bool):
         self.askBtn.setEnabled(not busy)
+        self.newChatBtn.setEnabled(not busy)
+        self.refreshModelsBtn.setEnabled(not busy)
+        self.stopBtn.setEnabled(busy)
+
+    def _current_model(self) -> str:
+        return self.modelEdit.currentText().strip() or DEFAULT_OPENROUTER_MODEL
+
+    def _render_history(self):
+        messages = list(self.history)
+        if self._stream_text:
+            messages.append({"role": "assistant", "content": self._stream_text + " ▌"})
+        if messages:
+            markdown = conversation_to_markdown(messages)
+            if self._error_text:
+                safe_error = self._error_text.replace("\n", " ")
+                markdown += f"\n---\n\n> ⚠️ {safe_error}\n"
+            self.out.setMarkdown(markdown)
+        else:
+            self.out.setHtml(
+                "<div style='margin:40px;color:#8b949e'>"
+                "<h2 style='color:#58a6ff'>MIA готова к работе</h2>"
+                "<p>История диалога хранится только на этом компьютере и не попадает в GitHub.</p>"
+                "<p>Спроси что угодно или дай задачу. MIA помнит контекст текущего диалога.</p>"
+                "</div>"
+            )
+        bar = self.out.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def refresh_models(self):
+        if not self.config.api_key:
+            self.modelStatus.setText("Добавь OPENROUTER_API_KEY в .env")
+            self.modelStatus.setObjectName("statusError")
+            self.modelStatus.style().unpolish(self.modelStatus)
+            self.modelStatus.style().polish(self.modelStatus)
+            return
+        self.refreshModelsBtn.setEnabled(False)
+        self.modelStatus.setText("Проверяю OpenRouter…")
+        worker = FuncWorker(fetch_openrouter_models, self.config.api_key)
+
+        def on_models(models):
+            current = self._current_model()
+            self.modelEdit.blockSignals(True)
+            self.modelEdit.clear()
+            self.modelEdit.addItems(models)
+            self.modelEdit.setCurrentText(current)
+            self.modelEdit.blockSignals(False)
+            self.modelStatus.setText(f"Онлайн · моделей: {len(models)}")
+            self.modelStatus.setObjectName("statusOk")
+            self.modelStatus.style().unpolish(self.modelStatus)
+            self.modelStatus.style().polish(self.modelStatus)
+            self.refreshModelsBtn.setEnabled(True)
+
+        def on_error(message):
+            self.modelStatus.setText(message)
+            self.modelStatus.setObjectName("statusError")
+            self.modelStatus.style().unpolish(self.modelStatus)
+            self.modelStatus.style().polish(self.modelStatus)
+            self.refreshModelsBtn.setEnabled(True)
+
+        worker.result.connect(on_models)
+        worker.error.connect(on_error)
+        self._start_worker(worker)
 
     def on_ask(self):
+        if self._chat_worker is not None:
+            return
         prompt = self.input.toPlainText().strip()
         if not prompt:
             return
-        model = self.modelEdit.text().strip() or DEFAULT_OPENROUTER_MODEL
+        self._error_text = ""
+        self._stream_text = ""
+        self.history.append({"role": "user", "content": prompt})
+        self.store.save(self.history)
+        self.input.clear()
+        self._render_history()
+
+        config = MIAConfig(
+            api_key=self.config.api_key,
+            model=self._current_model(),
+            system_prompt=self.config.system_prompt,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+        )
+        messages = build_context(self.history, config.system_prompt)
+        worker = ChatStreamWorker(messages, config)
+        self._chat_worker = worker
+        worker.chunk.connect(self._on_chunk)
+        worker.completed.connect(self._on_completed)
+        worker.failed.connect(self._on_failed)
+        worker.finished.connect(worker.deleteLater)
         self._toggle_ui(True)
-        worker = FuncWorker(llm_complete, prompt, model, None, None, 60)
-        worker.result.connect(lambda ans: self.out.appendPlainText(f"> {prompt}\n\n{ans}\n" + "-"*80))
-        worker.result.connect(lambda _: self._toggle_ui(False))
-        worker.error.connect(lambda e: (self.out.appendPlainText(f"Ошибка LLM: {e}"), self._toggle_ui(False)))
-        self._start_worker(worker)
+        self.modelStatus.setText("MIA думает…")
+        worker.start()
+
+    def _on_chunk(self, chunk: str):
+        self._stream_text += chunk
+        if not self._render_timer.isActive():
+            self._render_timer.start(70)
+
+    def _on_completed(self, answer: str, cancelled: bool):
+        self._render_timer.stop()
+        self._stream_text = ""
+        if answer:
+            self.history.append({"role": "assistant", "content": answer})
+            self.store.save(self.history)
+        self._chat_worker = None
+        self._toggle_ui(False)
+        self._render_history()
+        if cancelled:
+            self.modelStatus.setText("Генерация остановлена")
+        else:
+            self.modelStatus.setText(f"Готово · {self._current_model()}")
+            if answer and self.autoSpeak.isChecked():
+                self._speak(answer)
+
+    def _on_failed(self, message: str):
+        self._render_timer.stop()
+        self._stream_text = ""
+        self._error_text = message
+        self._chat_worker = None
+        self._toggle_ui(False)
+        self.modelStatus.setText("Ошибка подключения")
+        self.modelStatus.setObjectName("statusError")
+        self.modelStatus.style().unpolish(self.modelStatus)
+        self.modelStatus.style().polish(self.modelStatus)
+        self._render_history()
+
+    def stop_generation(self):
+        if self._chat_worker is not None:
+            self.modelStatus.setText("Останавливаю…")
+            self._chat_worker.cancel()
+
+    def new_chat(self):
+        if not self.history:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Новый диалог",
+            "Очистить локальную историю текущего диалога?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.history = []
+        self._error_text = ""
+        self.store.clear()
+        self._render_history()
+        self.modelStatus.setText("Новый диалог создан")
+
+    def export_chat(self):
+        if not self.history:
+            self.modelStatus.setText("Диалог пока пуст")
+            return
+        default_path = os.path.join(os.path.expanduser("~/Documents"), "mia_dialog.md")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Экспорт диалога",
+            default_path,
+            "Markdown (*.md);;Text (*.txt)",
+        )
+        if path:
+            write_text(path, conversation_to_markdown(self.history))
+            self.modelStatus.setText(f"Диалог сохранён: {os.path.basename(path)}")
+
+    def _last_answer(self) -> str:
+        for message in reversed(self.history):
+            if message.get("role") == "assistant":
+                return message.get("content", "")
+        return ""
+
+    def copy_last_answer(self):
+        answer = self._last_answer()
+        if answer:
+            QApplication.clipboard().setText(answer)
+            self.modelStatus.setText("Ответ скопирован")
+        else:
+            self.modelStatus.setText("Ответа пока нет")
+
+    def _speak(self, text: str):
+        if self.tts is None:
+            self.modelStatus.setText("Синтез речи недоступен")
+            return
+        self.tts.stop()
+        self.tts.say(text[:6000])
+
+    def speak_last_answer(self):
+        answer = self._last_answer()
+        if answer:
+            self._speak(answer)
+            self.modelStatus.setText("Озвучиваю ответ")
+        else:
+            self.modelStatus.setText("Ответа пока нет")
+
+    def start_dictation(self):
+        if self._voice_worker is not None:
+            return
+        if not VOICE_INPUT_AVAILABLE:
+            self.modelStatus.setText("Установи requirements-voice.txt")
+            return
+        self.micBtn.setEnabled(False)
+        self.micBtn.setText("Говори…")
+        self.modelStatus.setText("Записываю голос 6 секунд…")
+        worker = VoiceInputWorker(seconds=6)
+        self._voice_worker = worker
+
+        def on_text(text):
+            current = self.input.toPlainText().strip()
+            self.input.setPlainText(f"{current} {text}".strip())
+            self.input.setFocus()
+            self.modelStatus.setText("Диктовка распознана — проверь текст и отправь")
+
+        def on_error(message):
+            self._error_text = message
+            self.modelStatus.setText("Ошибка микрофона")
+            self._render_history()
+
+        def cleanup_voice():
+            self._voice_worker = None
+            self.micBtn.setText("Диктовать 6 сек")
+            self.micBtn.setEnabled(True)
+            worker.deleteLater()
+
+        worker.transcribed.connect(on_text)
+        worker.failed.connect(on_error)
+        worker.finished.connect(cleanup_voice)
+        worker.start()
+
+    def closeEvent(self, event):
+        if self._chat_worker is not None:
+            self._chat_worker.cancel()
+            self._chat_worker.wait(1500)
+        if self.tts is not None:
+            self.tts.stop()
+        if self._voice_worker is not None and sd is not None:
+            sd.stop()
+            self._voice_worker.wait(1500)
+        super().closeEvent(event)
 
 # ================== ВКЛАДКА ПОИСК ==================
 
@@ -451,6 +876,10 @@ build/
 Thumbs.db
 # Logs
 *.log
+logs/
+memory/
+models/
+tts/
 """
 
 class GitTab(QWidget):
@@ -551,11 +980,25 @@ class GitTab(QWidget):
         else:
             r = Repo(path)
 
-        # .gitignore
+        # .gitignore: mandatory local/private paths are always enforced before git add.
         gi = os.path.join(path, ".gitignore")
         if not os.path.exists(gi):
             write_text(gi, PY_GITIGNORE)
             self._log("Создан .gitignore (Python).")
+        else:
+            current_ignore = read_text(gi)
+            required_rules = [".env", ".venv/", "logs/", "memory/", "models/"]
+            missing_rules = [rule for rule in required_rules if rule not in current_ignore.splitlines()]
+            if missing_rules:
+                suffix = "\n# Added by MIA for local/private data\n" + "\n".join(missing_rules) + "\n"
+                write_text(gi, current_ignore.rstrip() + suffix)
+                self._log("В .gitignore добавлены правила защиты локальных данных.")
+
+        if r.git.ls_files(".env").strip():
+            raise RuntimeError(
+                ".env уже добавлен в индекс Git. Удали его из индекса командой "
+                "git rm --cached .env и повтори попытку."
+            )
 
         # первый коммит
         r.git.add(A=True)
@@ -581,12 +1024,12 @@ class GitTab(QWidget):
             return False
         self._log("НАЙДЕНЫ СЕКРЕТЫ — пуш отменён, чтобы не утекли ключи:")
         for p, name, line_no, line in findings[:200]:
-            self._log(f"- {name}: {p}:{line_no} -> {line}")
+            self._log(f"- {name}: {p}:{line_no} -> {redact_secrets(line)}")
         return True
 
     def _create_github_repo(self, owner: str, token: str, name: str, is_private: bool) -> str:
         """
-        Создаёт репозиторий на GitHub. Возвращает remote URL (с вшитым токеном) либо кидает исключение.
+        Создаёт репозиторий на GitHub и возвращает безопасный remote URL без токена.
         """
         # проверяем токен
         self._log("Проверяю токен GitHub…")
@@ -597,6 +1040,11 @@ class GitTab(QWidget):
         )
         if u.status_code != 200:
             raise RuntimeError(f"Ошибка профиля GitHub: {u.status_code} {u.text}")
+        authenticated_owner = str(u.json().get("login", "")).strip()
+        if authenticated_owner and authenticated_owner.casefold() != owner.casefold():
+            raise RuntimeError(
+                f"Токен принадлежит аккаунту {authenticated_owner}, а GITHUB_OWNER задан как {owner}."
+            )
 
         repo = slug_repo_name(name or "repo")
 
@@ -626,12 +1074,7 @@ class GitTab(QWidget):
         else:
             raise RuntimeError(f"Ошибка GitHub API: {r.status_code} {r.text}")
 
-        # remote URL с токеном (для автоматического пуша)
-        owner_enc = urllib.parse.quote(owner, safe="")
-        repo_enc = urllib.parse.quote(repo, safe="")
-        tok_enc = urllib.parse.quote(token, safe="")
-        remote_url = f"https://x-access-token:{tok_enc}@github.com/{owner_enc}/{repo_enc}.git"
-        return remote_url
+        return f"https://github.com/{owner}/{repo}.git"
 
     def _set_origin(self, repo: Repo, url: str):
         existing = [rem.name for rem in repo.remotes]
@@ -694,7 +1137,18 @@ class GitTab(QWidget):
             # 5) пуш в main
             self._log("Шаг 5: пуш в ветку main…")
             try:
-                repo.git.push("-u", "origin", "main")
+                # Передаём PAT только через окружение дочернего git-процесса.
+                # Токен не сохраняется в .git/config и не попадает в логи/аргументы команды.
+                basic_token = base64.b64encode(
+                    f"x-access-token:{token}".encode("utf-8")
+                ).decode("ascii")
+                with repo.git.custom_environment(
+                    GIT_CONFIG_COUNT="1",
+                    GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+                    GIT_CONFIG_VALUE_0=f"AUTHORIZATION: basic {basic_token}",
+                    GIT_TERMINAL_PROMPT="0",
+                ):
+                    repo.git.push("-u", "origin", "main")
                 self._log("Пуш завершён успешно.")
             except GitCommandError as e:
                 raise RuntimeError(f"Ошибка git push: {e}")
@@ -1662,19 +2116,38 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(APP_ICON_PATH))
 
         self.ipm = IpManager()
-        self.ip_autoswitch = QCheckBox("Сменять IP при старте ассистента")
-        self.ip_now = QPushButton("Сменить IP сейчас")
-        self.ip_label = QLabel("Текущий IP: —")
+        self.ip_now = QPushButton("Проверить сеть / сменить прокси")
+        self.ip_now.setObjectName("secondaryButton")
+        self.ip_label = QLabel("Сеть: не проверена")
         self.ip_now.clicked.connect(self.on_ip_cycle)
 
         top = QHBoxLayout()
-        top.addWidget(self.ip_autoswitch)
-        top.addWidget(self.ip_now)
+        if os.path.exists(APP_ICON_PATH):
+            avatar = QLabel()
+            avatar.setPixmap(
+                QPixmap(APP_ICON_PATH).scaled(
+                    46,
+                    46,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+            top.addWidget(avatar)
+        brand = QVBoxLayout()
+        title = QLabel("MIA Assistant")
+        title.setObjectName("brandTitle")
+        subtitle = QLabel("Персональный ИИ-помощник · память · голос · инструменты разработчика")
+        subtitle.setObjectName("brandSubtitle")
+        brand.addWidget(title)
+        brand.addWidget(subtitle)
+        top.addLayout(brand)
         top.addStretch(1)
         top.addWidget(self.ip_label)
+        top.addWidget(self.ip_now)
 
         tabs = QTabWidget()
-        tabs.addTab(ChatTab(DEFAULT_OPENROUTER_MODEL), "Чат")
+        self.chat_tab = ChatTab(DEFAULT_OPENROUTER_MODEL)
+        tabs.addTab(self.chat_tab, "MIA / Чат")
         tabs.addTab(SearchTab(DEFAULT_OPENROUTER_KEY, DEFAULT_OPENROUTER_MODEL), "Поиск")
         tabs.addTab(GitTab(), "Git")
         tabs.addTab(CodeTab(DEFAULT_OPENROUTER_MODEL), "Код")
@@ -1687,29 +2160,30 @@ class MainWindow(QMainWindow):
         lay.addLayout(top)
         lay.addWidget(tabs)
         self.setCentralWidget(central)
-
-        QTimer.singleShot(500, self._after_show)
-
-    def _after_show(self):
-        if self.ip_autoswitch.isChecked():
-            self.on_ip_cycle()
-        else:
-            self.ip_label.setText(f"Текущий IP: {self.ipm.current_ip()}")
+        self.statusBar().showMessage(
+            "OpenRouter настроен" if DEFAULT_OPENROUTER_KEY else "Добавь OPENROUTER_API_KEY в .env"
+        )
 
     def on_ip_cycle(self):
         msg = self.ipm.cycle()
         ip = self.ipm.current_ip()
-        self.ip_label.setText(f"Текущий IP: {ip}")
+        self.ip_label.setText(f"IP: {ip}")
         QMessageBox.information(self, "Смена IP", f"{msg}\nТекущий IP: {ip}")
 
 # ================== main() с ловлей краша ==================
 
 def main():
     app = QApplication(sys.argv)
+    app.setApplicationName("MIA Assistant")
+    app.setApplicationVersion("2.0.0")
+    app.setStyle("Fusion")
     if os.path.exists(APP_ICON_PATH):
         app.setWindowIcon(QIcon(APP_ICON_PATH))
+    style_path = os.path.join(BUNDLE_DIR, "ui", "style.qss")
+    if os.path.exists(style_path):
+        app.setStyleSheet(read_text(style_path))
     w = MainWindow()
-    w.resize(1280, 720)
+    w.resize(1380, 820)
     w.show()
     sys.exit(app.exec())
 
@@ -1717,7 +2191,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        import traceback, datetime
+        import traceback
         tb = traceback.format_exc()
         print("MIA упала с исключением:\n")
         print(tb)

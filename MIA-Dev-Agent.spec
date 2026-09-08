@@ -1,23 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+from pathlib import Path
 
-datas = [('C:\\Users\\Kamil\\Desktop\\mia_assistant\\ui', 'ui'), ('C:\\Users\\Kamil\\Desktop\\mia_assistant\\memory', 'memory'), ('C:\\Users\\Kamil\\Desktop\\mia_assistant\\logs', 'logs'), ('C:\\Users\\Kamil\\Desktop\\mia_assistant\\models', 'models')]
-binaries = []
-hiddenimports = []
-tmp_ret = collect_all('PySide6')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('readability_lxml')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('lxml')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
+project_root = Path(SPECPATH)
 
 a = Analysis(
-    ['C:\\Users\\Kamil\\Desktop\\mia_assistant\\run_mia.py'],
-    pathex=[],
-    binaries=binaries,
-    datas=datas,
-    hiddenimports=hiddenimports,
+    [str(project_root / "mia_dev_agent.py")],
+    pathex=[str(project_root)],
+    binaries=[],
+    datas=[
+        (str(project_root / "ui"), "ui"),
+        (str(project_root / ".env.example"), "."),
+    ],
+    hiddenimports=["PySide6.QtTextToSpeech"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -25,6 +20,7 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -32,7 +28,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='MIA-Dev-Agent',
+    name="MIA-Dev-Agent",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -44,6 +40,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+
 coll = COLLECT(
     exe,
     a.binaries,
@@ -51,5 +48,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='MIA-Dev-Agent',
+    name="MIA-Dev-Agent",
 )
