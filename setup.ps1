@@ -1,6 +1,8 @@
 param(
     [string]$OpenRouterKey = "",
+    [string]$DeepSeekKey = "",
     [switch]$WithVoice,
+    [switch]$WithLocalAI,
     [switch]$Launch
 )
 
@@ -46,7 +48,16 @@ if ($WithVoice) {
     Write-Host "Installing local speech-to-text..." -ForegroundColor Yellow
     & $VenvPython -m pip install -r "requirements-voice.txt"
     & (Join-Path $ProjectRoot "download_voice_model.ps1")
-    & $VenvPython -c "from vosk import Model; from mia_voice import native_model_path; Model(native_model_path('models/vosk-ru')); print('Russian Vosk model: OK')"
+    & $VenvPython -c "from vosk import Model, SetLogLevel; from mia_voice import native_model_path; SetLogLevel(-1); Model(native_model_path('models/vosk-ru')); print('Russian Vosk model: OK')"
+    $env:HF_HUB_DISABLE_SYMLINKS_WARNING = "1"
+    & $VenvPython -c "from faster_whisper import WhisperModel; WhisperModel('large-v3-turbo', device='cpu', compute_type='int8', download_root='models/whisper'); print('Whisper large-v3-turbo: OK')"
+}
+
+if ($WithLocalAI) {
+    Write-Host "Installing the keyless local AI fallback..." -ForegroundColor Yellow
+    & $VenvPython -m pip install -r "requirements-local.txt"
+    & (Join-Path $ProjectRoot "download_local_model.ps1")
+    & $VenvPython -c "from mia_core import local_model_ready; assert local_model_ready(); print('Local Qwen model: OK')"
 }
 
 $EnvPath = Join-Path $ProjectRoot ".env"
@@ -56,20 +67,28 @@ if (-not (Test-Path -LiteralPath $EnvPath)) {
     Write-Host "Created .env from the safe template." -ForegroundColor Green
 }
 
-if (-not [string]::IsNullOrWhiteSpace($OpenRouterKey)) {
+function Set-EnvValue([string]$Name, [string]$Value) {
     $Lines = Get-Content -LiteralPath $EnvPath
     $Found = $false
     $Updated = foreach ($Line in $Lines) {
-        if ($Line -match '^OPENROUTER_API_KEY=') {
+        if ($Line -match ("^" + [regex]::Escape($Name) + "=")) {
             $Found = $true
-            "OPENROUTER_API_KEY=$OpenRouterKey"
+            "$Name=$Value"
         } else {
             $Line
         }
     }
-    if (-not $Found) { $Updated += "OPENROUTER_API_KEY=$OpenRouterKey" }
+    if (-not $Found) { $Updated += "$Name=$Value" }
     $Updated | Set-Content -LiteralPath $EnvPath -Encoding UTF8
+}
+
+if (-not [string]::IsNullOrWhiteSpace($OpenRouterKey)) {
+    Set-EnvValue "OPENROUTER_API_KEY" $OpenRouterKey
     Write-Host "Saved the OpenRouter API key in the local .env file." -ForegroundColor Green
+}
+if (-not [string]::IsNullOrWhiteSpace($DeepSeekKey)) {
+    Set-EnvValue "DEEPSEEK_API_KEY" $DeepSeekKey
+    Write-Host "Saved the DeepSeek API key in the local .env file." -ForegroundColor Green
 }
 
 Write-Host "Checking the application import..." -ForegroundColor Yellow
@@ -78,8 +97,11 @@ $env:QT_QPA_PLATFORM = "offscreen"
 Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
 
 Write-Host "Setup complete. Run autorun.bat to start MIA." -ForegroundColor Green
-if ([string]::IsNullOrWhiteSpace($OpenRouterKey)) {
-    Write-Host "If needed, add OPENROUTER_API_KEY to the local .env file." -ForegroundColor Yellow
+if (
+    [string]::IsNullOrWhiteSpace($OpenRouterKey) -and
+    [string]::IsNullOrWhiteSpace($DeepSeekKey)
+) {
+    Write-Host "Cloud access is optional: add a fresh DEEPSEEK_API_KEY or OPENROUTER_API_KEY to .env." -ForegroundColor Yellow
 }
 
 if ($Launch) {

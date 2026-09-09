@@ -1,10 +1,18 @@
+import threading
+
+import mia_core
 from mia_core import (
     ConversationStore,
+    MIAConfig,
+    MIAError,
     build_context,
+    configured_provider_names,
     conversation_to_markdown,
     extract_wake_command,
+    is_safe_transcript_correction,
     iter_sse_content,
     resolve_voice_command,
+    stream_ai,
 )
 
 
@@ -84,4 +92,54 @@ def test_constrained_wake_recovers_when_free_model_hears_mir():
     assert resolve_voice_command("мир расскажи анекдот", constrained_wake=True) == (
         True,
         "расскажи анекдот",
+    )
+
+
+def test_direct_deepseek_key_in_legacy_variable_is_detected(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("MIA_PROVIDER_ORDER", "deepseek,openrouter")
+    config = MIAConfig(api_key="sk-direct-test-value")
+    assert configured_provider_names(config) == ["DeepSeek API"]
+
+
+def test_stream_ai_falls_back_before_first_output(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-direct-test-value")
+    monkeypatch.setenv("MIA_PROVIDER_ORDER", "deepseek,openrouter,local")
+    monkeypatch.setattr(mia_core, "local_model_ready", lambda: True)
+    attempts = []
+
+    def fail_cloud(_messages, _config, provider, _emit, _cancel, _timeout):
+        attempts.append(provider)
+        raise MIAError(f"{provider} unavailable")
+
+    def local_answer(_messages, _config, emit, _cancel):
+        attempts.append("local")
+        emit("готово")
+        return "готово"
+
+    monkeypatch.setattr(mia_core, "_stream_openai_compatible", fail_cloud)
+    monkeypatch.setattr(mia_core, "_stream_local", local_answer)
+    chunks = []
+    providers = []
+    answer = stream_ai(
+        [{"role": "user", "content": "тест"}],
+        MIAConfig(api_key="sk-or-v1-test-value"),
+        chunks.append,
+        providers.append,
+        threading.Event(),
+    )
+    assert answer == "готово"
+    assert chunks == ["готово"]
+    assert attempts == ["deepseek", "openrouter", "local"]
+    assert providers == ["deepseek", "openrouter", "local"]
+
+
+def test_transcript_correction_must_preserve_command_meaning():
+    assert is_safe_transcript_correction(
+        "расскажы пра питон и гит хап",
+        "Расскажи про Python и Git Hub",
+    )
+    assert not is_safe_transcript_correction(
+        "Сколько будет 2 плюс 3?",
+        "Два плюс три равно пять.",
     )

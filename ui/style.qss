@@ -63,6 +63,22 @@ QPushButton#voiceModeButton:checked {
     border-color: #2ea97d;
 }
 QLabel#voiceStatus { color: #65b7ff; }
+QLabel#actionStage {
+    color: #8ba4bd;
+    min-width: 165px;
+}
+QProgressBar {
+    min-height: 17px;
+    border: 1px solid #2b3d52;
+    border-radius: 7px;
+    background-color: #0b121d;
+    color: #dbeeff;
+    text-align: center;
+}
+QProgressBar::chunk {
+    border-radius: 6px;
+    background-color: #2388ff;
+}
 QPushButton#dangerButton:disabled,
 QPushButton#secondaryButton:disabled {
     background-color: #172235;

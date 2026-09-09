@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import threading
+from collections import deque
 from pathlib import Path
 from typing import ClassVar
 
@@ -52,7 +53,7 @@ def native_model_path(path: str | Path) -> str:
 
 class WakeWordWorker(QThread):
     ready = Signal()
-    phrase = Signal(str, bool)
+    phrase = Signal(str, bool, bytes)
     partial = Signal(str)
     failed = Signal(str)
 
@@ -107,6 +108,10 @@ class WakeWordWorker(QThread):
             wake_recognizer = KaldiRecognizer(model, self.sample_rate, wake_grammar)
             last_partial = ""
             was_paused = False
+            pre_roll: deque[bytes] = deque(maxlen=8)
+            utterance_blocks: list[bytes] = []
+            speech_active = False
+            wake_pending = False
 
             with sounddevice_module.RawInputStream(
                 samplerate=self.sample_rate,
@@ -122,6 +127,10 @@ class WakeWordWorker(QThread):
                             recognizer.Reset()
                             wake_recognizer.Reset()
                             last_partial = ""
+                            pre_roll.clear()
+                            utterance_blocks.clear()
+                            speech_active = False
+                            wake_pending = False
                         was_paused = True
                         continue
                     if was_paused:
@@ -130,27 +139,42 @@ class WakeWordWorker(QThread):
                         was_paused = False
 
                     audio = bytes(data)
+                    pre_roll.append(audio)
                     full_done = recognizer.AcceptWaveform(audio)
                     wake_done = wake_recognizer.AcceptWaveform(audio)
-                    if full_done or wake_done:
-                        result = (
-                            json.loads(recognizer.Result()).get("text", "").strip()
-                            if full_done
-                            else ""
-                        )
-                        wake_result = (
-                            json.loads(wake_recognizer.Result()).get("text", "").strip()
-                            if wake_done
-                            else ""
-                        )
-                        wake_detected = any(
+                    partial = json.loads(recognizer.PartialResult()).get(
+                        "partial", ""
+                    ).strip()
+                    wake_partial = json.loads(wake_recognizer.PartialResult()).get(
+                        "partial", ""
+                    ).strip()
+                    if not speech_active and (partial or wake_partial):
+                        utterance_blocks = list(pre_roll)
+                        speech_active = True
+                    elif speech_active:
+                        utterance_blocks.append(audio)
+                        if len(utterance_blocks) > 96:
+                            utterance_blocks = utterance_blocks[-96:]
+
+                    if wake_done:
+                        wake_result = json.loads(wake_recognizer.Result()).get(
+                            "text", ""
+                        ).strip()
+                        wake_pending = wake_pending or any(
                             word in {"мия", "миа"} for word in wake_result.split()
                         )
+
+                    if full_done:
+                        result = json.loads(recognizer.Result()).get("text", "").strip()
+                        captured_audio = b"".join(utterance_blocks or pre_roll)
                         last_partial = ""
-                        if result or wake_detected:
-                            self.phrase.emit(result, wake_detected)
+                        if result or wake_pending:
+                            self.phrase.emit(result, wake_pending, captured_audio)
+                        pre_roll.clear()
+                        utterance_blocks.clear()
+                        speech_active = False
+                        wake_pending = False
                     else:
-                        partial = json.loads(recognizer.PartialResult()).get("partial", "").strip()
                         if partial and partial != last_partial:
                             last_partial = partial
                             self.partial.emit(partial)

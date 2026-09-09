@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import requests
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+OLLAMA_API_URL = "http://127.0.0.1:11434/api/chat"
+DEFAULT_LOCAL_MODEL_PATH = Path("models/llm/qwen2.5-3b-instruct-q4_k_m.gguf")
+
+_LOCAL_LLM = None
+_LOCAL_LLM_LOAD_LOCK = threading.Lock()
+_LOCAL_LLM_GENERATION_LOCK = threading.Lock()
 DEFAULT_SYSTEM_PROMPT = (
     "Ты MIA — персональный ИИ-ассистент в духе Джарвиса. "
     "Отвечай на языке пользователя, будь инициативной, точной и практичной. "
@@ -34,6 +43,7 @@ class MIAConfig:
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     temperature: float = 0.45
     max_tokens: int = 2000
+    provider: str = "auto"
 
     @classmethod
     def from_env(cls) -> MIAConfig:
@@ -43,6 +53,7 @@ class MIAConfig:
             or "deepseek/deepseek-chat",
             system_prompt=os.getenv("MIA_SYSTEM_PROMPT", "").strip()
             or DEFAULT_SYSTEM_PROMPT,
+            provider=os.getenv("MIA_PROVIDER", "auto").strip().casefold() or "auto",
         )
 
 
@@ -226,6 +237,359 @@ def fetch_openrouter_models(api_key: str, timeout: int = 25) -> list[str]:
     return sorted(model_ids, key=str.casefold)
 
 
+def _direct_key(config: MIAConfig) -> str:
+    key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if (
+        not key
+        and config.api_key.startswith("sk-")
+        and not config.api_key.startswith("sk-or-v1-")
+    ):
+        # Earlier MIA versions documented only OPENROUTER_API_KEY. Accept a
+        # direct DeepSeek key stored there and route it to the correct endpoint.
+        key = config.api_key
+    return key
+
+
+def _provider_order(config: MIAConfig) -> list[str]:
+    requested = config.provider.strip().casefold()
+    if requested and requested != "auto":
+        return [requested]
+    configured = os.getenv(
+        "MIA_PROVIDER_ORDER",
+        "deepseek,openrouter,local,ollama",
+    )
+    allowed = {"deepseek", "openrouter", "local", "ollama"}
+    result = [item.strip().casefold() for item in configured.split(",")]
+    result = [item for item in result if item in allowed]
+    return result or ["deepseek", "openrouter", "local", "ollama"]
+
+
+def provider_display_name(provider: str) -> str:
+    return {
+        "deepseek": "DeepSeek API",
+        "openrouter": "OpenRouter",
+        "local": "Qwen2.5 · локально",
+        "ollama": "Ollama · локально",
+    }.get(provider, provider)
+
+
+def local_model_path() -> Path:
+    configured = os.getenv("MIA_LOCAL_MODEL_PATH", "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+        if path.is_absolute():
+            return path
+    else:
+        path = DEFAULT_LOCAL_MODEL_PATH
+    data_dir = Path(os.getenv("MIA_DATA_DIR", Path.cwd()))
+    return data_dir / path
+
+
+def local_model_ready() -> bool:
+    path = local_model_path()
+    return (
+        importlib.util.find_spec("llama_cpp") is not None
+        and path.is_file()
+        and path.stat().st_size > 100 * 1024 * 1024
+    )
+
+
+def ollama_ready(timeout: float = 0.25) -> bool:
+    chat_url = os.getenv("OLLAMA_API_URL", OLLAMA_API_URL).strip() or OLLAMA_API_URL
+    tags_url = chat_url.rsplit("/api/", 1)[0] + "/api/tags"
+    try:
+        return requests.get(tags_url, timeout=timeout).ok
+    except requests.RequestException:
+        return False
+
+
+def configured_provider_names(config: MIAConfig) -> list[str]:
+    names: list[str] = []
+    direct_key = _direct_key(config)
+    openrouter_key = (
+        config.api_key if config.api_key.startswith("sk-or-v1-") else ""
+    )
+    for provider in _provider_order(config):
+        available = (
+            (provider == "deepseek" and bool(direct_key))
+            or (provider == "openrouter" and bool(openrouter_key))
+            or (provider == "local" and local_model_ready())
+            or (provider == "ollama" and ollama_ready())
+        )
+        if available:
+            names.append(provider_display_name(provider))
+    return names
+
+
+def _provider_error(response: requests.Response, provider: str) -> str:
+    message = ""
+    try:
+        payload = response.json()
+        error = payload.get("error", {}) if isinstance(payload, dict) else {}
+        if isinstance(error, dict):
+            message = str(error.get("message", "")).strip()
+        elif error:
+            message = str(error).strip()
+    except (ValueError, TypeError):
+        pass
+    label = provider_display_name(provider)
+    if response.status_code == 401:
+        return f"{label}: API-ключ отклонён"
+    if response.status_code == 402:
+        return f"{label}: недостаточно средств или исчерпан лимит"
+    if response.status_code == 429:
+        return f"{label}: превышен лимит запросов"
+    suffix = f" · {message}" if message else ""
+    return f"{label}: HTTP {response.status_code}{suffix}"
+
+
+def _openai_headers(api_key: str, provider: str) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {api_key.strip()}",
+        "Content-Type": "application/json",
+    }
+    if provider == "openrouter":
+        headers.update(
+            {
+                "HTTP-Referer": "https://github.com/Himera2134567/mia_assistant",
+                "X-Title": "MIA Assistant",
+            }
+        )
+    return headers
+
+
+def _provider_target(config: MIAConfig, provider: str) -> tuple[str, str, str]:
+    if provider == "deepseek":
+        configured_model = os.getenv("DEEPSEEK_MODEL", "").strip()
+        model = (
+            config.model
+            if config.model.startswith("deepseek-v4-")
+            else configured_model or "deepseek-v4-flash"
+        )
+        return (
+            DEEPSEEK_API_URL,
+            _direct_key(config),
+            model,
+        )
+    if provider == "openrouter":
+        key = config.api_key if config.api_key.startswith("sk-or-v1-") else ""
+        return OPENROUTER_API_URL, key, config.model
+    if provider == "ollama":
+        return (
+            os.getenv("OLLAMA_API_URL", OLLAMA_API_URL).strip() or OLLAMA_API_URL,
+            "",
+            os.getenv("OLLAMA_MODEL", "qwen3:4b").strip() or "qwen3:4b",
+        )
+    raise MIAError(f"Неизвестный ИИ-провайдер: {provider}")
+
+
+def _stream_openai_compatible(
+    messages: Sequence[Mapping[str, str]],
+    config: MIAConfig,
+    provider: str,
+    on_chunk: Callable[[str], None],
+    cancel_event: threading.Event,
+    timeout: int,
+) -> str:
+    api_url, api_key, model = _provider_target(config, provider)
+    if not api_key:
+        raise MIAError(f"{provider_display_name(provider)}: API-ключ не настроен")
+    chunks: list[str] = []
+    try:
+        with requests.post(
+            api_url,
+            headers=_openai_headers(api_key, provider),
+            json={
+                "model": model,
+                "messages": list(messages),
+                "temperature": config.temperature,
+                "max_tokens": config.max_tokens,
+                "stream": True,
+            },
+            timeout=(15, timeout),
+            stream=True,
+        ) as response:
+            if not response.ok:
+                raise MIAError(_provider_error(response, provider))
+            for chunk in iter_sse_content(response.iter_lines()):
+                if cancel_event.is_set():
+                    break
+                chunks.append(chunk)
+                on_chunk(chunk)
+    except requests.Timeout as exc:
+        raise MIAError(f"{provider_display_name(provider)} не ответил вовремя") from exc
+    except requests.RequestException as exc:
+        raise MIAError(f"Нет связи с {provider_display_name(provider)}: {exc}") from exc
+    answer = "".join(chunks).strip()
+    if not answer and not cancel_event.is_set():
+        raise MIAError(f"{provider_display_name(provider)} вернул пустой ответ")
+    return answer
+
+
+def _get_local_llm():
+    global _LOCAL_LLM
+    if not local_model_ready():
+        raise MIAError(
+            "Локальная модель не установлена · выполни setup.ps1 -WithLocalAI"
+        )
+    with _LOCAL_LLM_LOAD_LOCK:
+        if _LOCAL_LLM is None:
+            from llama_cpp import Llama
+
+            threads = max(4, min(12, (os.cpu_count() or 8) - 2))
+            _LOCAL_LLM = Llama(
+                model_path=str(local_model_path().resolve()),
+                n_ctx=int(os.getenv("MIA_LOCAL_CONTEXT", "8192")),
+                n_batch=512,
+                n_threads=threads,
+                verbose=False,
+            )
+    return _LOCAL_LLM
+
+
+def _stream_local(
+    messages: Sequence[Mapping[str, str]],
+    config: MIAConfig,
+    on_chunk: Callable[[str], None],
+    cancel_event: threading.Event,
+) -> str:
+    chunks: list[str] = []
+    try:
+        model = _get_local_llm()
+        with _LOCAL_LLM_GENERATION_LOCK:
+            response = model.create_chat_completion(
+                messages=[dict(message) for message in messages],
+                temperature=config.temperature,
+                max_tokens=config.max_tokens,
+                stream=True,
+            )
+            for event in response:
+                if cancel_event.is_set():
+                    break
+                try:
+                    chunk = event["choices"][0]["delta"].get("content", "")
+                except (KeyError, IndexError, TypeError, AttributeError):
+                    continue
+                if isinstance(chunk, str) and chunk:
+                    chunks.append(chunk)
+                    on_chunk(chunk)
+    except Exception as exc:
+        raise MIAError(f"Ошибка локальной модели: {exc}") from exc
+    answer = "".join(chunks).strip()
+    if not answer and not cancel_event.is_set():
+        raise MIAError("Локальная модель вернула пустой ответ")
+    return answer
+
+
+def _stream_ollama(
+    messages: Sequence[Mapping[str, str]],
+    config: MIAConfig,
+    on_chunk: Callable[[str], None],
+    cancel_event: threading.Event,
+    timeout: int,
+) -> str:
+    api_url, _api_key, model = _provider_target(config, "ollama")
+    chunks: list[str] = []
+    try:
+        with requests.post(
+            api_url,
+            json={
+                "model": model,
+                "messages": list(messages),
+                "stream": True,
+                "think": False,
+                "options": {
+                    "temperature": config.temperature,
+                    "num_predict": config.max_tokens,
+                },
+            },
+            timeout=(3, timeout),
+            stream=True,
+        ) as response:
+            if not response.ok:
+                raise MIAError(_provider_error(response, "ollama"))
+            for raw_line in response.iter_lines():
+                if cancel_event.is_set():
+                    break
+                if not raw_line:
+                    continue
+                try:
+                    payload = json.loads(raw_line)
+                    chunk = payload.get("message", {}).get("content", "")
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    continue
+                if isinstance(chunk, str) and chunk:
+                    chunks.append(chunk)
+                    on_chunk(chunk)
+    except requests.Timeout as exc:
+        raise MIAError("Локальная Ollama не ответила вовремя") from exc
+    except requests.RequestException as exc:
+        raise MIAError("Локальная Ollama не запущена или недоступна") from exc
+    answer = "".join(chunks).strip()
+    if not answer and not cancel_event.is_set():
+        raise MIAError("Локальная модель Ollama вернула пустой ответ")
+    return answer
+
+
+def stream_ai(
+    messages: Sequence[Mapping[str, str]],
+    config: MIAConfig,
+    on_chunk: Callable[[str], None],
+    on_provider: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    timeout: int = 120,
+) -> str:
+    """Stream from the first working provider, falling back before output starts."""
+    cancel_event = cancel_event or threading.Event()
+    errors: list[str] = []
+    for provider in _provider_order(config):
+        if cancel_event.is_set():
+            return ""
+        if provider == "deepseek" and not _direct_key(config):
+            continue
+        if provider == "openrouter" and not config.api_key.startswith("sk-or-v1-"):
+            continue
+        if provider == "local" and not local_model_ready():
+            if config.provider == "local":
+                errors.append("локальная модель не установлена")
+            continue
+        if on_provider is not None:
+            on_provider(provider)
+        emitted = False
+
+        def emit(chunk: str) -> None:
+            nonlocal emitted
+            emitted = True
+            on_chunk(chunk)
+
+        try:
+            if provider == "local":
+                return _stream_local(messages, config, emit, cancel_event)
+            if provider == "ollama":
+                return _stream_ollama(
+                    messages, config, emit, cancel_event, timeout
+                )
+            return _stream_openai_compatible(
+                messages, config, provider, emit, cancel_event, timeout
+            )
+        except MIAError as exc:
+            if emitted:
+                raise
+            errors.append(str(exc))
+    if not errors:
+        errors.append("не настроено ни одного ИИ-провайдера")
+    raise MIAError("Не удалось получить ответ: " + " → ".join(errors))
+
+
+def complete_ai(
+    messages: Sequence[Mapping[str, str]],
+    config: MIAConfig,
+    timeout: int = 90,
+) -> str:
+    chunks: list[str] = []
+    return stream_ai(messages, config, chunks.append, timeout=timeout)
+
+
 class ConversationStore:
     """Small local JSON store. The memory directory is excluded from Git."""
 
@@ -303,3 +667,23 @@ def resolve_voice_command(text: str, constrained_wake: bool = False) -> tuple[bo
         words = text.split()
         return True, " ".join(words[1:]).strip() if len(words) > 1 else ""
     return heard_wake, command
+
+
+def is_safe_transcript_correction(original: str, candidate: str) -> bool:
+    """Reject a language-model correction if it likely changed the command."""
+    original = original.strip()
+    candidate = candidate.strip()
+    if not original or not candidate or "\n" in candidate:
+        return False
+    if "?" in original and "?" not in candidate:
+        return False
+    def normalize(value: str) -> str:
+        return re.sub(r"[^\w]+", " ", value.casefold(), flags=re.UNICODE).strip()
+
+    source = normalize(original)
+    corrected = normalize(candidate)
+    if not source or not corrected:
+        return False
+    length_ratio = len(corrected) / len(source)
+    similarity = SequenceMatcher(None, source, corrected).ratio()
+    return 0.55 <= length_ratio <= 1.8 and similarity >= 0.45

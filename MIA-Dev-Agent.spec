@@ -1,18 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_dynamic_libs
 
 
 project_root = Path(SPECPATH)
+llama_binaries = collect_dynamic_libs("llama_cpp")
 
 a = Analysis(
     [str(project_root / "mia_dev_agent.py")],
     pathex=[str(project_root)],
-    binaries=[],
+    binaries=llama_binaries,
     datas=[
         (str(project_root / "ui"), "ui"),
         (str(project_root / ".env.example"), "."),
     ],
-    hiddenimports=["PySide6.QtTextToSpeech"],
+    hiddenimports=["PySide6.QtTextToSpeech", "llama_cpp"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

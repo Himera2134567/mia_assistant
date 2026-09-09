@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else BUNDLE_DIR
+os.environ.setdefault("MIA_DATA_DIR", DATA_DIR)
 load_dotenv(os.path.join(DATA_DIR, ".env"))
 
 import requests
@@ -54,7 +55,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QPlainTextEdit, QTabWidget, QFileDialog, QGridLayout, QTableWidget,
     QTableWidgetItem, QGroupBox, QCheckBox, QSplitter, QMessageBox, QAbstractItemView,
-    QListWidget, QListWidgetItem, QComboBox, QTextBrowser
+    QListWidget, QListWidgetItem, QComboBox, QTextBrowser, QProgressBar
 )
 
 try:
@@ -67,18 +68,23 @@ from mia_core import (
     ConversationStore,
     MIAConfig,
     build_context,
-    complete_openrouter,
+    complete_ai,
+    configured_provider_names,
     conversation_to_markdown,
+    extract_wake_command,
     fetch_openrouter_models,
+    is_safe_transcript_correction,
+    provider_display_name,
     resolve_voice_command,
-    stream_openrouter,
+    stream_ai,
 )
 from mia_voice import VOICE_RUNTIME_AVAILABLE, WakeWordWorker, vosk_model_ready
 
-APP_TITLE = "MIA Assistant 2.1.1"
+APP_TITLE = "MIA Assistant 2.2"
 APP_ICON_PATH = os.path.join(BUNDLE_DIR, "ui", "avatar_mia_v3.png")
 CHAT_HISTORY_PATH = os.path.join(DATA_DIR, "memory", "chat_history.json")
 WHISPER_MODELS_PATH = os.path.join(DATA_DIR, "models", "whisper")
+WHISPER_MODEL_NAME = os.getenv("MIA_WHISPER_MODEL", "large-v3-turbo").strip() or "large-v3-turbo"
 VOSK_MODEL_PATH = os.getenv("MIA_VOSK_MODEL_PATH", "").strip() or os.path.join(
     DATA_DIR,
     "models",
@@ -185,6 +191,7 @@ class FuncWorker(QThread):
 
 class ChatStreamWorker(QThread):
     chunk = Signal(str)
+    provider = Signal(str)
     completed = Signal(str, bool)
     failed = Signal(str)
 
@@ -199,10 +206,11 @@ class ChatStreamWorker(QThread):
 
     def run(self):
         try:
-            answer = stream_openrouter(
+            answer = stream_ai(
                 self.messages,
                 self.config,
                 self.chunk.emit,
+                on_provider=self.provider.emit,
                 cancel_event=self._cancel_event,
             )
             self.completed.emit(answer, self._cancel_event.is_set())
@@ -212,14 +220,21 @@ class ChatStreamWorker(QThread):
 
 class VoiceInputWorker(QThread):
     transcribed = Signal(str)
+    stage = Signal(int, str)
     failed = Signal(str)
-    _model = None
+    _models = {}
     _model_lock = threading.Lock()
 
-    def __init__(self, seconds: int = 6, sample_rate: int = 16_000):
+    def __init__(
+        self,
+        seconds: int = 6,
+        sample_rate: int = 16_000,
+        pcm_audio: bytes | None = None,
+    ):
         super().__init__()
         self.seconds = seconds
         self.sample_rate = sample_rate
+        self.pcm_audio = pcm_audio
 
     @staticmethod
     def _load_dependencies():
@@ -238,32 +253,49 @@ class VoiceInputWorker(QThread):
     @classmethod
     def _get_model(cls):
         with cls._model_lock:
-            if cls._model is None:
+            if WHISPER_MODEL_NAME not in cls._models:
                 ensure_dir(WHISPER_MODELS_PATH)
-                cls._model = WhisperModel(
-                    "tiny",
+                cls._models[WHISPER_MODEL_NAME] = WhisperModel(
+                    WHISPER_MODEL_NAME,
                     device="cpu",
                     compute_type="int8",
                     download_root=WHISPER_MODELS_PATH,
                 )
-            return cls._model
+            return cls._models[WHISPER_MODEL_NAME]
 
     def run(self):
         try:
             self._load_dependencies()
-            recording = sd.rec(
-                int(self.seconds * self.sample_rate),
-                samplerate=self.sample_rate,
-                channels=1,
-                dtype="float32",
-            )
-            sd.wait()
+            if self.pcm_audio is None:
+                self.stage.emit(20, "Записываю речь…")
+                recording = sd.rec(
+                    int(self.seconds * self.sample_rate),
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype="float32",
+                )
+                sd.wait()
+                audio = recording.reshape(-1)
+            else:
+                import numpy as np
+
+                audio = np.frombuffer(self.pcm_audio, dtype=np.int16).astype(np.float32)
+                audio /= 32768.0
+            self.stage.emit(32, f"Загружаю Whisper {WHISPER_MODEL_NAME}…")
             model = self._get_model()
+            self.stage.emit(42, "Точно распознаю русскую речь…")
             segments, _ = model.transcribe(
-                recording.reshape(-1),
+                audio,
                 vad_filter=False,
-                beam_size=3,
+                beam_size=5,
                 language="ru",
+                temperature=0.0,
+                condition_on_previous_text=False,
+                initial_prompt=(
+                    "Русская команда персональному ассистенту Мия. "
+                    "Термины: Мия, DeepSeek, OpenRouter, Ollama, Python, GitHub, Windows."
+                ),
+                hotwords="Мия DeepSeek OpenRouter Ollama Python GitHub Windows",
             )
             text = " ".join(segment.text.strip() for segment in segments).strip()
             if not text:
@@ -271,6 +303,45 @@ class VoiceInputWorker(QThread):
             self.transcribed.emit(text)
         except Exception as exc:
             self.failed.emit(f"Ошибка диктовки: {exc}")
+
+
+class TranscriptCorrectionWorker(QThread):
+    corrected = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, text: str, config: MIAConfig):
+        super().__init__()
+        self.text = text
+        self.config = config
+
+    def run(self):
+        correction_config = MIAConfig(
+            api_key=self.config.api_key,
+            model=self.config.model,
+            system_prompt=(
+                "Ты корректор расшифровки русской речи. Исправь только ошибки "
+                "распознавания, орфографию и пунктуацию. Не отвечай на команду, "
+                "не добавляй факты и не меняй смысл. Верни одну исправленную строку."
+            ),
+            temperature=0.0,
+            max_tokens=160,
+            provider=self.config.provider,
+        )
+        messages = [
+            {"role": "system", "content": correction_config.system_prompt},
+            {"role": "user", "content": self.text},
+        ]
+        try:
+            result = complete_ai(messages, correction_config, timeout=45)
+            result = result.strip().strip("`\"'«»").strip()
+            if (
+                not is_safe_transcript_correction(self.text, result)
+                or len(result) > max(500, len(self.text) * 3)
+            ):
+                raise RuntimeError("корректор вернул неподходящий текст")
+            self.corrected.emit(result)
+        except Exception as exc:  # noqa: BLE001 - original transcript is a safe fallback
+            self.failed.emit(str(exc))
 
 # ================== LLM ==================
 
@@ -290,13 +361,14 @@ def llm_complete(
         model=model,
         system_prompt=system_prompt,
         max_tokens=2000,
+        provider=os.getenv("MIA_PROVIDER", "auto").strip().casefold() or "auto",
     )
     messages = build_context(
         [{"role": "user", "content": prompt}],
         system_prompt=system_prompt,
         max_chars=50_000,
     )
-    return complete_openrouter(messages, config, timeout=timeout)
+    return complete_ai(messages, config, timeout=timeout)
 
 # ================== ПОИСК / READABILITY ==================
 
@@ -327,7 +399,7 @@ def fetch_readable(url: str, timeout: float = 15.0) -> Tuple[str, str]:
 SECRET_PATTERNS = [
     (r"gh[pous]_[A-Za-z0-9_]{36,}", "GitHub PAT"),
     (r"github_pat_[A-Za-z0-9_]{20,}", "GitHub fine-grained PAT"),
-    (r"sk-[A-Za-z0-9\-]{20,}", "OpenAI / OpenRouter key"),
+    (r"sk-[A-Za-z0-9\-]{20,}", "OpenAI / OpenRouter / DeepSeek key"),
     (r"AKIA[0-9A-Z]{16}", "AWS Access Key"),
     (r"AIza[0-9A-Za-z\-_]{35}", "Google API Key"),
     (r"\d{5,}:[A-Za-z0-9_\-]{30,}", "Telegram Bot Token"),
@@ -393,16 +465,21 @@ class ChatTab(QWidget):
             system_prompt=self.config.system_prompt,
             temperature=self.config.temperature,
             max_tokens=2500,
+            provider=self.config.provider,
         )
         self.store = ConversationStore(CHAT_HISTORY_PATH)
         self.history = self.store.load()
         self._workers: List[QThread] = []
         self._chat_worker: Optional[ChatStreamWorker] = None
         self._voice_worker: Optional[VoiceInputWorker] = None
+        self._correction_worker: Optional[TranscriptCorrectionWorker] = None
         self._wake_worker: Optional[WakeWordWorker] = None
         self._voice_request_pending = False
         self._voice_waiting_for_tts = False
         self._wake_armed = False
+        self._voice_transcription_context: tuple[bool, str] | None = None
+        self._pending_transcript = ""
+        self._active_provider = ""
         self._stream_text = ""
         self._error_text = ""
 
@@ -438,19 +515,30 @@ class ChatTab(QWidget):
 
         top = QHBoxLayout()
         top.addWidget(QLabel("Модель:"))
+        provider_names = configured_provider_names(self.config)
+        displayed_model = self.config.model
+        if "DeepSeek API" in provider_names and "OpenRouter" not in provider_names:
+            displayed_model = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+        elif not any(name in provider_names for name in ("DeepSeek API", "OpenRouter")):
+            if "Qwen2.5 · локально" in provider_names:
+                displayed_model = "local/qwen2.5-3b-instruct"
+            elif "Ollama · локально" in provider_names:
+                displayed_model = os.getenv("OLLAMA_MODEL", "qwen3:4b")
         self.modelEdit = QComboBox()
         self.modelEdit.setEditable(True)
-        self.modelEdit.addItem(self.config.model)
-        self.modelEdit.setCurrentText(self.config.model)
+        self.modelEdit.addItem(displayed_model)
+        self.modelEdit.setCurrentText(displayed_model)
         self.modelEdit.setMinimumWidth(280)
         self.refreshModelsBtn = QPushButton("Обновить список")
         self.refreshModelsBtn.setObjectName("secondaryButton")
         self.refreshModelsBtn.clicked.connect(self.refresh_models)
         self.modelStatus = QLabel(
-            "API-ключ найден" if self.config.api_key else "API-ключ не настроен"
+            "Авто: " + " → ".join(provider_names)
+            if provider_names
+            else "ИИ-провайдер не настроен"
         )
         self.modelStatus.setMinimumWidth(190)
-        self.modelStatus.setObjectName("statusOk" if self.config.api_key else "statusError")
+        self.modelStatus.setObjectName("statusOk" if provider_names else "statusError")
         top.addWidget(self.modelEdit, 1)
         top.addWidget(self.refreshModelsBtn)
         top.addWidget(self.modelStatus)
@@ -498,6 +586,17 @@ class ChatTab(QWidget):
         voice_row.addWidget(self.voiceModeBtn)
         voice_row.addWidget(self.voiceStatus, 1)
 
+        progress_row = QHBoxLayout()
+        self.actionStage = QLabel("Готово к работе")
+        self.actionStage.setObjectName("actionStage")
+        self.actionProgress = QProgressBar()
+        self.actionProgress.setRange(0, 100)
+        self.actionProgress.setValue(0)
+        self.actionProgress.setFormat("Ожидание")
+        self.actionProgress.setTextVisible(True)
+        progress_row.addWidget(self.actionStage)
+        progress_row.addWidget(self.actionProgress, 1)
+
         self.out = QTextBrowser()
         self.out.setOpenExternalLinks(True)
         self.out.setPlaceholderText("Здесь появится диалог с MIA.")
@@ -536,11 +635,19 @@ class ChatTab(QWidget):
         layout.addLayout(top)
         layout.addLayout(actions)
         layout.addLayout(voice_row)
+        layout.addLayout(progress_row)
         layout.addWidget(self.out)
         layout.addWidget(self.input)
         layout.addLayout(send_row)
 
         self._render_history()
+
+    def _set_action_progress(self, value: int, text: str):
+        value = max(0, min(100, int(value)))
+        self.actionProgress.setRange(0, 100)
+        self.actionProgress.setValue(value)
+        self.actionProgress.setFormat(f"{value}% · {text}")
+        self.actionStage.setText(text)
 
     def _start_worker(self, w: QThread):
         self._workers.append(w)
@@ -582,9 +689,27 @@ class ChatTab(QWidget):
         bar.setValue(bar.maximum())
 
     def refresh_models(self):
-        if not self.config.api_key:
-            self.modelStatus.setText("Добавь OPENROUTER_API_KEY в .env")
-            self.modelStatus.setObjectName("statusError")
+        provider_names = configured_provider_names(self.config)
+        direct_deepseek = "DeepSeek API" in provider_names
+        openrouter_ready = self.config.api_key.startswith("sk-or-v1-")
+        if direct_deepseek and not openrouter_ready:
+            self.modelEdit.clear()
+            self.modelEdit.addItems(["deepseek-v4-flash", "deepseek-v4-pro"])
+            self.modelEdit.setCurrentText(
+                os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+            )
+            self.modelStatus.setText("Прямой DeepSeek настроен")
+            self.modelStatus.setObjectName("statusOk")
+            return
+        if not openrouter_ready:
+            self.modelStatus.setText(
+                "Список облачных моделей недоступен · локальная Qwen готова"
+                if "Qwen2.5 · локально" in provider_names
+                else "Добавь DEEPSEEK_API_KEY или OPENROUTER_API_KEY"
+            )
+            self.modelStatus.setObjectName(
+                "statusOk" if "Qwen2.5 · локально" in provider_names else "statusError"
+            )
             self.modelStatus.style().unpolish(self.modelStatus)
             self.modelStatus.style().polish(self.modelStatus)
             return
@@ -635,10 +760,12 @@ class ChatTab(QWidget):
             system_prompt=self.config.system_prompt,
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
+            provider=self.config.provider,
         )
         messages = build_context(self.history, config.system_prompt)
         worker = ChatStreamWorker(messages, config)
         self._chat_worker = worker
+        worker.provider.connect(self._on_provider_selected)
         worker.chunk.connect(self._on_chunk)
         worker.completed.connect(self._on_completed)
         worker.failed.connect(self._on_failed)
@@ -647,10 +774,19 @@ class ChatTab(QWidget):
             self._wake_worker.set_paused(True)
         self._toggle_ui(True)
         self.modelStatus.setText("MIA думает…")
+        self._set_action_progress(60, "Выбираю нейросеть…")
         worker.start()
+
+    def _on_provider_selected(self, provider: str):
+        self._active_provider = provider
+        label = provider_display_name(provider)
+        self.modelStatus.setText(f"Подключаю: {label}")
+        self._set_action_progress(68, f"Подключаю {label}…")
 
     def _on_chunk(self, chunk: str):
         self._stream_text += chunk
+        progress = min(92, 74 + len(self._stream_text) // 120)
+        self._set_action_progress(progress, "Формирую ответ…")
         if not self._render_timer.isActive():
             self._render_timer.start(70)
 
@@ -667,13 +803,17 @@ class ChatTab(QWidget):
         self._render_history()
         if cancelled:
             self.modelStatus.setText("Генерация остановлена")
+            self._set_action_progress(100, "Остановлено")
             self._resume_voice_listening()
         else:
-            self.modelStatus.setText(f"Готово · {self._current_model()}")
+            provider = provider_display_name(self._active_provider) if self._active_provider else self._current_model()
+            self.modelStatus.setText(f"Готово · {provider}")
             should_speak = bool(answer) and (voice_request or self.autoSpeak.isChecked())
             if should_speak:
+                self._set_action_progress(95, "Озвучиваю ответ…")
                 self._speak(answer, resume_voice=self.voiceModeBtn.isChecked())
             else:
+                self._set_action_progress(100, "Готово")
                 self._resume_voice_listening()
 
     def _on_failed(self, message: str):
@@ -687,12 +827,14 @@ class ChatTab(QWidget):
         self.modelStatus.setObjectName("statusError")
         self.modelStatus.style().unpolish(self.modelStatus)
         self.modelStatus.style().polish(self.modelStatus)
+        self._set_action_progress(100, "Ошибка — подробности в диалоге")
         self._render_history()
         self._resume_voice_listening()
 
     def stop_generation(self):
         if self._chat_worker is not None:
             self.modelStatus.setText("Останавливаю…")
+            self._set_action_progress(95, "Останавливаю генерацию…")
             self._chat_worker.cancel()
 
     def new_chat(self):
@@ -745,6 +887,7 @@ class ChatTab(QWidget):
     def _speak(self, text: str, resume_voice: bool = False):
         if self.tts is None:
             self.modelStatus.setText("Синтез речи недоступен")
+            self._set_action_progress(100, "Ответ готов без озвучивания")
             if resume_voice:
                 self._resume_voice_listening()
             return
@@ -782,6 +925,7 @@ class ChatTab(QWidget):
             self.input.setPlainText(f"{current} {text}".strip())
             self.input.setFocus()
             self.modelStatus.setText("Диктовка распознана — проверь текст и отправь")
+            self._set_action_progress(100, "Диктовка распознана")
 
         def on_error(message):
             self._error_text = message
@@ -795,6 +939,7 @@ class ChatTab(QWidget):
             worker.deleteLater()
 
         worker.transcribed.connect(on_text)
+        worker.stage.connect(self._set_action_progress)
         worker.failed.connect(on_error)
         worker.finished.connect(cleanup_voice)
         worker.start()
@@ -829,6 +974,8 @@ class ChatTab(QWidget):
             self._wake_armed = False
             self._voice_request_pending = False
             self._voice_waiting_for_tts = False
+            self._voice_transcription_context = None
+            self._pending_transcript = ""
             if self.tts is not None:
                 self.tts.stop()
             worker = self._wake_worker
@@ -837,34 +984,148 @@ class ChatTab(QWidget):
                 worker.wait(1500)
             self.voiceModeBtn.setText("Голосовой режим: ВЫКЛ")
             self.voiceStatus.setText("Микрофон выключен")
+            self._set_action_progress(0, "Голосовой режим выключен")
 
     def _on_voice_mode_ready(self):
         self.voiceStatus.setText("Слушаю локально · скажи «Мия»")
         self.modelStatus.setText("Русский голосовой режим готов")
+        self._set_action_progress(0, "Ожидаю слово «Мия»")
 
     def _on_voice_partial(self, text: str):
         if self._wake_worker is not None and not self._voice_request_pending:
             self.voiceStatus.setText(f"Слышу: {text[:90]}")
 
-    def _on_voice_phrase(self, text: str, constrained_wake: bool = False):
-        if not self.voiceModeBtn.isChecked() or self._chat_worker is not None:
+    def _on_voice_phrase(
+        self,
+        text: str,
+        constrained_wake: bool = False,
+        pcm_audio: bytes = b"",
+    ):
+        if (
+            not self.voiceModeBtn.isChecked()
+            or self._chat_worker is not None
+            or self._voice_worker is not None
+            or self._correction_worker is not None
+        ):
             return
         heard_wake, command = resolve_voice_command(text, constrained_wake)
         if heard_wake:
-            if command:
-                self._submit_voice_command(command)
-            else:
-                self._wake_armed = True
-                self._wake_timer.start()
-                self.voiceStatus.setText("Слушаю команду…")
-                QApplication.beep()
+            self._wake_armed = False
+            self._wake_timer.stop()
+            self._set_action_progress(18, "Слово «Мия» услышано")
+            self._start_accurate_transcription(pcm_audio, True, command)
             return
         if self._wake_armed:
             self._wake_timer.stop()
             self._wake_armed = False
-            self._submit_voice_command(text)
+            self._start_accurate_transcription(pcm_audio, False, text)
         else:
             self.voiceStatus.setText("Слушаю локально · скажи «Мия»")
+
+    def _start_accurate_transcription(
+        self,
+        pcm_audio: bytes,
+        wake_expected: bool,
+        fallback_command: str,
+    ):
+        if not pcm_audio:
+            if fallback_command:
+                self._start_transcript_correction(fallback_command)
+            elif wake_expected:
+                self._arm_voice_command()
+            return
+        if self._wake_worker is not None:
+            self._wake_worker.set_paused(True)
+        self._voice_transcription_context = (wake_expected, fallback_command)
+        self.voiceStatus.setText("Распознаю команду точной моделью Whisper…")
+        self._set_action_progress(28, "Подготавливаю запись…")
+        worker = VoiceInputWorker(pcm_audio=pcm_audio)
+        self._voice_worker = worker
+        worker.stage.connect(self._set_action_progress)
+        worker.transcribed.connect(self._on_accurate_transcript)
+        worker.failed.connect(self._on_accurate_transcript_failed)
+
+        def cleanup_voice():
+            if self._voice_worker is worker:
+                self._voice_worker = None
+            worker.deleteLater()
+
+        worker.finished.connect(cleanup_voice)
+        worker.start()
+
+    def _on_accurate_transcript(self, text: str):
+        if not self.voiceModeBtn.isChecked():
+            return
+        wake_expected, fallback = self._voice_transcription_context or (False, "")
+        self._voice_transcription_context = None
+        command = text.strip()
+        if wake_expected:
+            heard_wake, whisper_command = extract_wake_command(command)
+            if heard_wake:
+                command = whisper_command
+            elif fallback:
+                command = fallback
+            else:
+                _heard, command = resolve_voice_command(command, constrained_wake=True)
+        if not command:
+            self._arm_voice_command()
+            return
+        self.voiceStatus.setText(f"Распознано: {command[:100]}")
+        self._start_transcript_correction(command)
+
+    def _on_accurate_transcript_failed(self, message: str):
+        wake_expected, fallback = self._voice_transcription_context or (False, "")
+        self._voice_transcription_context = None
+        if fallback:
+            self._start_transcript_correction(fallback)
+        elif wake_expected:
+            self._arm_voice_command()
+        else:
+            self._error_text = message
+            self._render_history()
+            self._resume_voice_listening()
+
+    def _arm_voice_command(self):
+        self._wake_armed = True
+        self._wake_timer.start()
+        if self._wake_worker is not None:
+            self._wake_worker.set_paused(False)
+        self.voiceStatus.setText("Слушаю команду…")
+        self._set_action_progress(22, "Говорите команду после сигнала")
+        QApplication.beep()
+
+    def _start_transcript_correction(self, command: str):
+        self._pending_transcript = command.strip()
+        if not self._pending_transcript:
+            self._resume_voice_listening()
+            return
+        self.voiceStatus.setText("Исправляю ошибки распознавания…")
+        self._set_action_progress(50, "Исправляю текст по контексту…")
+        worker = TranscriptCorrectionWorker(self._pending_transcript, self.config)
+        self._correction_worker = worker
+        worker.corrected.connect(self._on_transcript_corrected)
+        worker.failed.connect(self._on_transcript_correction_failed)
+
+        def cleanup_correction():
+            if self._correction_worker is worker:
+                self._correction_worker = None
+            worker.deleteLater()
+
+        worker.finished.connect(cleanup_correction)
+        worker.start()
+
+    def _on_transcript_corrected(self, command: str):
+        self._pending_transcript = ""
+        if self.voiceModeBtn.isChecked():
+            self._submit_voice_command(command)
+
+    def _on_transcript_correction_failed(self, _message: str):
+        command = self._pending_transcript
+        self._pending_transcript = ""
+        if not self.voiceModeBtn.isChecked():
+            return
+        self.voiceStatus.setText("Корректор недоступен · использую точную расшифровку")
+        self._submit_voice_command(command)
 
     def _submit_voice_command(self, command: str):
         command = command.strip()
@@ -875,6 +1136,7 @@ class ChatTab(QWidget):
         if self._wake_worker is not None:
             self._wake_worker.set_paused(True)
         self.voiceStatus.setText(f"Команда: {command[:100]}")
+        self._set_action_progress(58, "Команда подготовлена")
         self.input.setPlainText(command)
         self._voice_request_pending = True
         self.on_ask()
@@ -885,6 +1147,7 @@ class ChatTab(QWidget):
     def _disarm_wake_word(self):
         self._wake_armed = False
         self.voiceStatus.setText("Команда не услышана · скажи «Мия» ещё раз")
+        self._resume_voice_listening()
 
     def _on_tts_state_changed(self, state):
         if (
@@ -894,6 +1157,7 @@ class ChatTab(QWidget):
         ):
             self._voice_waiting_for_tts = False
             self._voice_resume_timer.stop()
+            self._set_action_progress(100, "Ответ озвучен")
             QTimer.singleShot(350, self._resume_voice_listening)
 
     def _resume_voice_listening(self):
@@ -902,6 +1166,8 @@ class ChatTab(QWidget):
         if self.voiceModeBtn.isChecked() and self._wake_worker is not None:
             self._wake_worker.set_paused(False)
             self.voiceStatus.setText("Слушаю локально · скажи «Мия»")
+            if self._chat_worker is None and self._voice_worker is None:
+                self._set_action_progress(0, "Ожидаю слово «Мия»")
 
     def _on_voice_mode_failed(self, message: str):
         self._error_text = message
@@ -921,6 +1187,8 @@ class ChatTab(QWidget):
         if self._voice_worker is not None and sd is not None:
             sd.stop()
             self._voice_worker.wait(1500)
+        if self._correction_worker is not None:
+            self._correction_worker.wait(1500)
         super().closeEvent(event)
 
 # ================== ВКЛАДКА ПОИСК ==================
@@ -2346,8 +2614,11 @@ class MainWindow(QMainWindow):
         lay.addLayout(top)
         lay.addWidget(tabs)
         self.setCentralWidget(central)
+        providers = configured_provider_names(MIAConfig.from_env())
         self.statusBar().showMessage(
-            "OpenRouter настроен" if DEFAULT_OPENROUTER_KEY else "Добавь OPENROUTER_API_KEY в .env"
+            "ИИ: " + " → ".join(providers)
+            if providers
+            else "Добавь DEEPSEEK_API_KEY или OPENROUTER_API_KEY в .env"
         )
 
     def on_ip_cycle(self):
@@ -2361,7 +2632,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("MIA Assistant")
-    app.setApplicationVersion("2.1.1")
+    app.setApplicationVersion("2.2.0")
     app.setStyle("Fusion")
     if os.path.exists(APP_ICON_PATH):
         app.setWindowIcon(QIcon(APP_ICON_PATH))
