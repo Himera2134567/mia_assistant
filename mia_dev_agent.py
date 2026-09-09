@@ -75,7 +75,7 @@ from mia_core import (
 )
 from mia_voice import VOICE_RUNTIME_AVAILABLE, WakeWordWorker, vosk_model_ready
 
-APP_TITLE = "MIA Assistant 2.1"
+APP_TITLE = "MIA Assistant 2.1.1"
 APP_ICON_PATH = os.path.join(BUNDLE_DIR, "ui", "avatar_mia_v3.png")
 CHAT_HISTORY_PATH = os.path.join(DATA_DIR, "memory", "chat_history.json")
 WHISPER_MODELS_PATH = os.path.join(DATA_DIR, "models", "whisper")
@@ -2361,7 +2361,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("MIA Assistant")
-    app.setApplicationVersion("2.1.0")
+    app.setApplicationVersion("2.1.1")
     app.setStyle("Fusion")
     if os.path.exists(APP_ICON_PATH):
         app.setWindowIcon(QIcon(APP_ICON_PATH))
