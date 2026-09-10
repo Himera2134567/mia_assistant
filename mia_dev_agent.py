@@ -1,6 +1,6 @@
 # mia_dev_agent.py
 # MIA — Мини-GUI ассистента: Чат / Поиск / Git / Код / ТЗ / Методологии / Правила + смена IP.
-# Зависимости по максимуму: PySide6, requests, python-dotenv, ddgs, httpx, lxml, readability-lxml, GitPython
+# Зависимости по максимуму: PySide6, requests, python-dotenv, веб-поиск, GitPython
 # Но при отсутствии части библиотек приложение не падает — соответствующий функционал просто отключается.
 
 import os
@@ -21,21 +21,6 @@ load_dotenv(os.path.join(DATA_DIR, ".env"))
 import requests
 
 # --- опциональные зависимости (не должны валить приложение) ---
-try:
-    import httpx
-except ImportError:
-    httpx = None
-
-try:
-    from ddgs import DDGS
-except ImportError:
-    DDGS = None
-
-try:
-    from readability import Document
-except ImportError:
-    Document = None
-
 try:
     from git import Repo, GitCommandError, InvalidGitRepositoryError, NoSuchPathError
 except ImportError:
@@ -79,8 +64,17 @@ from mia_core import (
     stream_ai,
 )
 from mia_voice import VOICE_RUNTIME_AVAILABLE, WakeWordWorker, vosk_model_ready
+from mia_web import (
+    WEB_SEARCH_AVAILABLE,
+    augment_messages_with_web,
+    collect_web_sources,
+    fetch_readable,
+    format_sources_markdown,
+    should_search_web,
+    text_for_speech,
+)
 
-APP_TITLE = "MIA Assistant 2.2"
+APP_TITLE = "MIA Assistant 2.2.1"
 APP_ICON_PATH = os.path.join(BUNDLE_DIR, "ui", "avatar_mia_v3.png")
 CHAT_HISTORY_PATH = os.path.join(DATA_DIR, "memory", "chat_history.json")
 WHISPER_MODELS_PATH = os.path.join(DATA_DIR, "models", "whisper")
@@ -192,13 +186,21 @@ class FuncWorker(QThread):
 class ChatStreamWorker(QThread):
     chunk = Signal(str)
     provider = Signal(str)
+    stage = Signal(int, str)
+    sources = Signal(object)
     completed = Signal(str, bool)
     failed = Signal(str)
 
-    def __init__(self, messages: List[Dict[str, str]], config: MIAConfig):
+    def __init__(
+        self,
+        messages: List[Dict[str, str]],
+        config: MIAConfig,
+        web_search_enabled: bool = True,
+    ):
         super().__init__()
         self.messages = messages
         self.config = config
+        self.web_search_enabled = web_search_enabled
         self._cancel_event = threading.Event()
 
     def cancel(self):
@@ -206,9 +208,58 @@ class ChatStreamWorker(QThread):
 
     def run(self):
         try:
+            messages = self.messages
+            generation_config = self.config
+            query = next(
+                (
+                    message.get("content", "")
+                    for message in reversed(messages)
+                    if message.get("role") == "user"
+                ),
+                "",
+            )
+            if (
+                self.web_search_enabled
+                and WEB_SEARCH_AVAILABLE
+                and should_search_web(query)
+            ):
+                self.stage.emit(35, "Ищу свежую информацию в интернете…")
+                sources = collect_web_sources(query)
+                if self._cancel_event.is_set():
+                    self.completed.emit("", True)
+                    return
+                self.sources.emit(sources)
+                self.stage.emit(55, f"Извлечено источников: {len(sources)}")
+                system_prompt = next(
+                    (
+                        message.get("content", self.config.system_prompt)
+                        for message in messages
+                        if message.get("role") == "system"
+                    ),
+                    self.config.system_prompt,
+                )
+                recent_history = [
+                    message
+                    for message in messages
+                    if message.get("role") in {"user", "assistant"}
+                ]
+                messages = build_context(
+                    recent_history,
+                    system_prompt,
+                    max_chars=5_000,
+                )
+                messages = augment_messages_with_web(messages, query, sources)
+                generation_config = MIAConfig(
+                    api_key=self.config.api_key,
+                    model=self.config.model,
+                    system_prompt=self.config.system_prompt,
+                    temperature=self.config.temperature,
+                    max_tokens=min(1_400, self.config.max_tokens),
+                    provider=self.config.provider,
+                )
             answer = stream_ai(
-                self.messages,
-                self.config,
+                messages,
+                generation_config,
                 self.chunk.emit,
                 on_provider=self.provider.emit,
                 cancel_event=self._cancel_event,
@@ -370,30 +421,6 @@ def llm_complete(
     )
     return complete_ai(messages, config, timeout=timeout)
 
-# ================== ПОИСК / READABILITY ==================
-
-def web_search(query: str, n: int = 10) -> List[Dict[str, str]]:
-    if DDGS is None:
-        raise RuntimeError("Библиотека ddgs не установлена (pip install ddgs)")
-    results: List[Dict[str, str]] = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(query, safesearch="Moderate", max_results=n):
-            results.append({
-                "title": r.get("title", ""),
-                "href": r.get("href", ""),
-                "body": r.get("body", "")
-            })
-    return results
-
-def fetch_readable(url: str, timeout: float = 15.0) -> Tuple[str, str]:
-    if httpx is None or Document is None:
-        return "", "Для извлечения текста нужны httpx и readability-lxml."
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-        resp = client.get(url)
-        resp.raise_for_status()
-        doc = Document(resp.text)
-        return doc.short_title(), doc.summary()
-
 # ================== СКАНЕР СЕКРЕТОВ ==================
 
 SECRET_PATTERNS = [
@@ -480,6 +507,7 @@ class ChatTab(QWidget):
         self._voice_transcription_context: tuple[bool, str] | None = None
         self._pending_transcript = ""
         self._active_provider = ""
+        self._web_sources: List[Dict[str, str]] = []
         self._stream_text = ""
         self._error_text = ""
 
@@ -557,6 +585,13 @@ class ChatTab(QWidget):
         self.speakBtn.setObjectName("secondaryButton")
         self.speakBtn.clicked.connect(self.speak_last_answer)
         self.autoSpeak = QCheckBox("Озвучивать автоматически")
+        self.webSearch = QCheckBox("Автопоиск свежих данных")
+        self.webSearch.setChecked(WEB_SEARCH_AVAILABLE)
+        self.webSearch.setEnabled(WEB_SEARCH_AVAILABLE)
+        self.webSearch.setToolTip(
+            "Для запросов со словами «найди», «сегодня», «последние новости» и подобных "
+            "MIA прочитает несколько страниц и подготовит ответ со ссылками на источники."
+        )
         self.speakBtn.setEnabled(self.tts is not None)
         self.autoSpeak.setEnabled(self.tts is not None)
         actions.addWidget(self.newChatBtn)
@@ -564,6 +599,7 @@ class ChatTab(QWidget):
         actions.addWidget(self.copyBtn)
         actions.addWidget(self.speakBtn)
         actions.addWidget(self.autoSpeak)
+        actions.addWidget(self.webSearch)
         actions.addStretch(1)
 
         voice_row = QHBoxLayout()
@@ -662,6 +698,7 @@ class ChatTab(QWidget):
         self.askBtn.setEnabled(not busy)
         self.newChatBtn.setEnabled(not busy)
         self.refreshModelsBtn.setEnabled(not busy)
+        self.webSearch.setEnabled(not busy and WEB_SEARCH_AVAILABLE)
         self.stopBtn.setEnabled(busy)
 
     def _current_model(self) -> str:
@@ -749,6 +786,7 @@ class ChatTab(QWidget):
             return
         self._error_text = ""
         self._stream_text = ""
+        self._web_sources = []
         self.history.append({"role": "user", "content": prompt})
         self.store.save(self.history)
         self.input.clear()
@@ -763,9 +801,15 @@ class ChatTab(QWidget):
             provider=self.config.provider,
         )
         messages = build_context(self.history, config.system_prompt)
-        worker = ChatStreamWorker(messages, config)
+        worker = ChatStreamWorker(
+            messages,
+            config,
+            web_search_enabled=self.webSearch.isChecked(),
+        )
         self._chat_worker = worker
         worker.provider.connect(self._on_provider_selected)
+        worker.stage.connect(self._set_action_progress)
+        worker.sources.connect(self._on_web_sources)
         worker.chunk.connect(self._on_chunk)
         worker.completed.connect(self._on_completed)
         worker.failed.connect(self._on_failed)
@@ -774,8 +818,17 @@ class ChatTab(QWidget):
             self._wake_worker.set_paused(True)
         self._toggle_ui(True)
         self.modelStatus.setText("MIA думает…")
-        self._set_action_progress(60, "Выбираю нейросеть…")
+        if self.webSearch.isChecked() and should_search_web(prompt):
+            self._set_action_progress(25, "Готовлю веб-поиск…")
+        else:
+            self._set_action_progress(60, "Выбираю нейросеть…")
         worker.start()
+
+    def _on_web_sources(self, sources):
+        self._web_sources = list(sources or [])
+        self.modelStatus.setText(
+            f"Интернет: прочитано источников — {len(self._web_sources)}"
+        )
 
     def _on_provider_selected(self, provider: str):
         self._active_provider = provider
@@ -795,8 +848,13 @@ class ChatTab(QWidget):
         self._voice_request_pending = False
         self._render_timer.stop()
         self._stream_text = ""
-        if answer:
-            self.history.append({"role": "assistant", "content": answer})
+        stored_answer = answer
+        if answer and self._web_sources:
+            stored_answer = answer.rstrip() + "\n\n" + format_sources_markdown(
+                self._web_sources
+            )
+        if stored_answer:
+            self.history.append({"role": "assistant", "content": stored_answer})
             self.store.save(self.history)
         self._chat_worker = None
         self._toggle_ui(False)
@@ -808,7 +866,9 @@ class ChatTab(QWidget):
         else:
             provider = provider_display_name(self._active_provider) if self._active_provider else self._current_model()
             self.modelStatus.setText(f"Готово · {provider}")
-            should_speak = bool(answer) and (voice_request or self.autoSpeak.isChecked())
+            should_speak = bool(answer) and (
+                voice_request or self.autoSpeak.isChecked() or bool(self._web_sources)
+            )
             if should_speak:
                 self._set_action_progress(95, "Озвучиваю ответ…")
                 self._speak(answer, resume_voice=self.voiceModeBtn.isChecked())
@@ -823,7 +883,7 @@ class ChatTab(QWidget):
         self._voice_request_pending = False
         self._chat_worker = None
         self._toggle_ui(False)
-        self.modelStatus.setText("Ошибка подключения")
+        self.modelStatus.setText("Ошибка запроса")
         self.modelStatus.setObjectName("statusError")
         self.modelStatus.style().unpolish(self.modelStatus)
         self.modelStatus.style().polish(self.modelStatus)
@@ -898,7 +958,13 @@ class ChatTab(QWidget):
         if resume_voice:
             self.voiceStatus.setText("MIA отвечает голосом…")
             self._voice_resume_timer.start()
-        self.tts.say(text[:6000])
+        spoken = text_for_speech(text)
+        if spoken:
+            self.tts.say(spoken[:6000])
+        elif resume_voice:
+            self._voice_waiting_for_tts = False
+            self._voice_resume_timer.stop()
+            self._resume_voice_listening()
 
     def speak_last_answer(self):
         answer = self._last_answer()
@@ -1193,22 +1259,100 @@ class ChatTab(QWidget):
 
 # ================== ВКЛАДКА ПОИСК ==================
 
+class WebAnswerWorker(QThread):
+    stage = Signal(int, str)
+    provider = Signal(str)
+    completed = Signal(str, object)
+    failed = Signal(str)
+
+    def __init__(self, query: str, config: MIAConfig):
+        super().__init__()
+        self.query = query
+        self.config = config
+
+    def run(self):
+        try:
+            self.stage.emit(15, "Ищу подходящие страницы…")
+            sources = collect_web_sources(self.query)
+            self.stage.emit(55, f"Прочитано источников: {len(sources)}")
+            messages = build_context(
+                [{"role": "user", "content": self.query}],
+                self.config.system_prompt,
+            )
+            messages = augment_messages_with_web(messages, self.query, sources)
+            chunks: List[str] = []
+            answer = stream_ai(
+                messages,
+                self.config,
+                chunks.append,
+                on_provider=self.provider.emit,
+            )
+            self.completed.emit(answer, sources)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class SearchTab(QWidget):
     def __init__(self, api_key: str, model: str):
         super().__init__()
         self.api_key = api_key
         self.model = model
         self._workers: List[QThread] = []
+        env_config = MIAConfig.from_env()
+        self.config = MIAConfig(
+            api_key=env_config.api_key,
+            model=model or env_config.model,
+            system_prompt=env_config.system_prompt,
+            temperature=0.2,
+            max_tokens=1400,
+            provider=env_config.provider,
+        )
+        self.last_answer = ""
+        self._speaking = False
+
+        self.tts = QTextToSpeech(self) if QTextToSpeech is not None else None
+        if self.tts is not None:
+            russian_locale = QLocale("ru_RU")
+            if russian_locale in self.tts.availableLocales():
+                self.tts.setLocale(russian_locale)
+                voices = self.tts.availableVoices()
+                preferred = next(
+                    (voice for voice in voices if "Irina" in voice.name()),
+                    voices[0] if voices else None,
+                )
+                if preferred is not None:
+                    self.tts.setVoice(preferred)
+            self.tts.stateChanged.connect(self._on_tts_state_changed)
 
         v = QVBoxLayout(self)
 
         h = QHBoxLayout()
         self.q = QLineEdit()
-        self.q.setPlaceholderText("Запрос для DuckDuckGo…")
-        self.go = QPushButton("Искать")
+        self.q.setPlaceholderText("Что найти и объяснить?")
+        self.q.returnPressed.connect(self.do_search)
+        self.go = QPushButton("Найти и ответить")
         self.go.clicked.connect(self.do_search)
         h.addWidget(self.q, 1)
         h.addWidget(self.go, 0)
+
+        controls = QHBoxLayout()
+        self.speakBtn = QPushButton("Озвучить ответ")
+        self.speakBtn.setObjectName("secondaryButton")
+        self.speakBtn.clicked.connect(self.speak_answer)
+        self.speakBtn.setEnabled(False)
+        self.autoSpeak = QCheckBox("Озвучивать автоматически")
+        self.autoSpeak.setChecked(True)
+        self.autoSpeak.setEnabled(self.tts is not None)
+        self.status = QLabel("Готово к поиску")
+        self.status.setObjectName("actionStage")
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFormat("Ожидание")
+        controls.addWidget(self.speakBtn)
+        controls.addWidget(self.autoSpeak)
+        controls.addWidget(self.status)
+        controls.addWidget(self.progress, 1)
 
         self.grid = QTableWidget(0, 3)
         self.grid.setHorizontalHeaderLabels(["Заголовок", "Ссылка", "Сниппет"])
@@ -1216,9 +1360,10 @@ class SearchTab(QWidget):
         self.grid.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.grid.cellDoubleClicked.connect(self.on_open)
 
-        self.reader = QPlainTextEdit()
+        self.reader = QTextBrowser()
         self.reader.setReadOnly(True)
-        self.reader.setMaximumBlockCount(40000)
+        self.reader.setOpenExternalLinks(True)
+        self.reader.document().setMaximumBlockCount(40000)
 
         split = QSplitter(Qt.Orientation.Vertical)
         wrap1 = QWidget(); l1 = QVBoxLayout(wrap1); l1.addWidget(self.grid)
@@ -1226,16 +1371,21 @@ class SearchTab(QWidget):
         split.addWidget(wrap1); split.addWidget(wrap2); split.setSizes([300, 400])
 
         v.addLayout(h)
+        v.addLayout(controls)
         v.addWidget(split)
 
-        tip = QLabel("Двойной клик по строке — извлечь основной текст страницы.")
+        tip = QLabel(
+            "MIA читает несколько страниц и отвечает по их содержимому. "
+            "Двойной клик открывает извлечённый текст выбранного источника."
+        )
         tip.setStyleSheet("color:#9aa;")
         v.addWidget(tip)
 
         self.results: List[Dict[str, str]] = []
 
-        if DDGS is None:
+        if not WEB_SEARCH_AVAILABLE:
             self.reader.setPlainText("Поиск отключён: не установлена библиотека ddgs (pip install ddgs).")
+            self.go.setEnabled(False)
 
     def _start_worker(self, w: QThread):
         self._workers.append(w)
@@ -1248,41 +1398,97 @@ class SearchTab(QWidget):
 
     def _toggle_search(self, busy: bool):
         self.go.setEnabled(not busy)
+        self.q.setEnabled(not busy)
+
+    def _set_progress(self, value: int, message: str):
+        value = max(0, min(100, int(value)))
+        self.progress.setValue(value)
+        self.progress.setFormat(f"{value}% · {message}")
+        self.status.setText(message)
+
+    def _populate_results(self, results):
+        self.results = list(results or [])
+        self.grid.setRowCount(0)
+        for result in self.results:
+            row = self.grid.rowCount()
+            self.grid.insertRow(row)
+            self.grid.setItem(row, 0, QTableWidgetItem(result.get("title", "")))
+            self.grid.setItem(row, 1, QTableWidgetItem(result.get("url", "")))
+            self.grid.setItem(row, 2, QTableWidgetItem(result.get("snippet", "")))
 
     def do_search(self):
-        if DDGS is None:
+        if not WEB_SEARCH_AVAILABLE:
             self.reader.setPlainText("Поиск невозможен: нет библиотеки ddgs.")
             return
-        q = self.q.text().strip()
-        if not q:
+        query = self.q.text().strip()
+        if not query:
             return
         self._toggle_search(True)
-        worker = FuncWorker(web_search, q, 12)
-        def on_res(res):
-            self.results = res or []
-            self.grid.setRowCount(0)
-            for r in self.results:
-                row = self.grid.rowCount()
-                self.grid.insertRow(row)
-                self.grid.setItem(row, 0, QTableWidgetItem(r.get("title","")))
-                self.grid.setItem(row, 1, QTableWidgetItem(r.get("href","")))
-                self.grid.setItem(row, 2, QTableWidgetItem(r.get("body","")))
-            self._toggle_search(False)
-        worker.result.connect(on_res)
-        worker.error.connect(lambda e: (self.reader.setPlainText(f"Ошибка поиска: {e}"), self._toggle_search(False)))
+        self.last_answer = ""
+        self.speakBtn.setEnabled(False)
+        self.reader.setPlainText("Ищу и читаю страницы…")
+        self._set_progress(5, "Запускаю веб-поиск…")
+        worker = WebAnswerWorker(query, self.config)
+        worker.stage.connect(self._set_progress)
+        worker.provider.connect(
+            lambda provider: self._set_progress(
+                70,
+                f"Готовлю ответ через {provider_display_name(provider)}…",
+            )
+        )
+        worker.completed.connect(self._on_answer)
+        worker.failed.connect(self._on_search_error)
         self._start_worker(worker)
+
+    def _on_answer(self, answer: str, sources):
+        self.last_answer = answer.strip()
+        self._populate_results(sources)
+        rendered = self.last_answer
+        source_markdown = format_sources_markdown(self.results)
+        if source_markdown:
+            rendered += "\n\n" + source_markdown
+        self.reader.setMarkdown(rendered)
+        self._set_progress(100, "Ответ готов")
+        self._toggle_search(False)
+        self.speakBtn.setEnabled(bool(self.last_answer) and self.tts is not None)
+        if self.last_answer and self.autoSpeak.isChecked():
+            self.speak_answer()
+
+    def _on_search_error(self, message: str):
+        self.reader.setPlainText(f"Не удалось подготовить ответ: {message}")
+        self._set_progress(100, "Ошибка веб-поиска")
+        self._toggle_search(False)
+
+    def speak_answer(self):
+        if self.tts is None or not self.last_answer:
+            return
+        spoken = text_for_speech(self.last_answer)
+        if spoken:
+            self.tts.stop()
+            self._speaking = True
+            self.tts.say(spoken[:6000])
+            self.status.setText("Озвучиваю найденный ответ…")
+
+    def _on_tts_state_changed(self, state):
+        if (
+            self.tts is not None
+            and self._speaking
+            and state == QTextToSpeech.State.Ready
+        ):
+            self._speaking = False
+            self.status.setText("Ответ озвучен")
 
     def on_open(self, row: int, col: int):
         if row < 0 or row >= len(self.results):
             return
-        url = self.results[row].get("href","")
+        url = self.results[row].get("url", "")
         if not url:
             return
         self.reader.setPlainText("Загружаю читабельный текст страницы…")
         worker = FuncWorker(fetch_readable, url, 20.0)
         def on_res(pair):
-            title, html = pair
-            self.reader.setPlainText(f"{title or url}\n\n{html}")
+            title, text = pair
+            self.reader.setPlainText(f"{title or url}\n\n{text}")
         worker.result.connect(on_res)
         worker.error.connect(lambda e: self.reader.setPlainText(f"Не удалось извлечь содержимое: {e}"))
         self._start_worker(worker)
@@ -2632,7 +2838,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("MIA Assistant")
-    app.setApplicationVersion("2.2.0")
+    app.setApplicationVersion("2.2.1")
     app.setStyle("Fusion")
     if os.path.exists(APP_ICON_PATH):
         app.setWindowIcon(QIcon(APP_ICON_PATH))
