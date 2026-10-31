@@ -13,8 +13,8 @@ from typing import Optional, List, Dict, Tuple
 
 from dotenv import load_dotenv
 
-BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else BUNDLE_DIR
+BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("MIA_DATA_DIR") or (os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "MIAAssistant") if getattr(sys,"frozen",False) else BUNDLE_DIR)
 os.environ.setdefault("MIA_DATA_DIR", DATA_DIR)
 load_dotenv(os.path.join(DATA_DIR, ".env"))
 
@@ -2863,5 +2863,4 @@ if __name__ == "__main__":
                 f.write(tb)
         except Exception:
             pass
-        input("\nОшибка при запуске MIA. Лог сохранён в mia_crash.log (рядом с скриптом).\n"
-              "Нажми Enter, чтобы закрыть окно...")
+        raise SystemExit(1)
